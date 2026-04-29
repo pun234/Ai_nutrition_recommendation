@@ -1,16 +1,14 @@
-# React + Vite
+Nutri Track AI: Next-Gen Fitness & Nutrition Partner
+Nutri Track AI is a cloud-integrated, multimodal health ecosystem that leverages Artificial Intelligence to automate the most tedious parts of fitness tracking. By unifying Computer Vision for food analysis and Generative AI for workout and diet synthesis, it provides a closed-loop coaching experience that adapts to your unique biometrics and goals.  
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+🚀 Key Features
+Multimodal Food Vision (Scanner): Upload photos of your meals to automatically identify dishes and estimate calories, protein, carbs, and fats. No manual typing required.  
 
-Currently, two official plugins are available:
+AI Form Expert (Rehab): Analyzes photos or video frames of your exercise to provide real-time biomechanical feedback, identifies injury risks, and suggests corrective YouTube tutorials.  
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Protocol Synthesis: Generates 7-day personalized Indian meal plans and matching exercise routines based on your BMI, TDEE, fitness objectives, and clinical conditions.  
 
-## React Compiler
+Intelligent Gym Log: Track lifts and volume with a dedicated dashboard that calculates your AI-predicted One-Rep Max (1RM) to ensure progressive overload.  
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Resilient AI Engine: Utilizes a dual-engine architecture with Gemini 2.0 Flash and an OpenRouter fallback to ensure the app remains functional even during high API traffic.  
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
