@@ -8,7 +8,7 @@ import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
-  signOut,
+  signOut
 } from 'firebase/auth';
 import {
   getFirestore,
@@ -21,15 +21,35 @@ import {
   serverTimestamp,
 } from 'firebase/firestore';
 import {
-  Home, Calculator, Camera, Activity, Dumbbell,
-  LayoutDashboard, LogOut, User, CheckCircle2,
-  ChevronRight, Sparkles, Zap, BrainCircuit, Stethoscope,
-  Calendar, AlertCircle, Leaf, Beef,
-  TrendingDown, TrendingUp, Shield, Target, Swords,
+  Home,
+  Calculator,
+  Camera,
+  Activity,
+  Dumbbell,
+  HeartPulse,
+  ClipboardList,
+  LayoutDashboard,
+  LogOut,
+  User,
+  CheckCircle2,
+  ChevronRight,
+  Sparkles,
+  Zap,
+  BrainCircuit,
+  Stethoscope,
+  Calendar,
+  AlertCircle,
+  Leaf,
+  Beef,
+  Flame,
+  TrendingDown,
+  TrendingUp,
+  Shield,
+  Target,
+  Swords,
 } from 'lucide-react';
 
-
-// ─── Firebase Config ──────────────────────────────────────────
+// ─── Firebase Config from .env (Vite) ────────────────────────────────────────
 const firebaseConfig = {
   apiKey:            import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain:        import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
@@ -40,15 +60,14 @@ const firebaseConfig = {
 };
 
 const rawAppId =
-  typeof __app_id !== 'undefined'
-    ? __app_id
-    : (import.meta.env.VITE_APP_ID || 'nutri-track-ai');
+  typeof __app_id !== 'undefined' ? __app_id : (import.meta.env.VITE_APP_ID || 'gym-buddy-neural');
 const appId = rawAppId.replace(/\//g, '_');
-const GEMINI_API_KEY  = import.meta.env.VITE_GEMINI_API_KEY  || '';
-const OPENROUTER_KEY  = import.meta.env.VITE_OPENROUTER_API_KEY || '';
-const GEN_MODEL       = 'gemini-2.0-flash';
 
-// ─── Fitness Objectives ───────────────────────────────────────
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
+const OPENROUTER_KEY = import.meta.env.VITE_OPENROUTER_API_KEY;
+const GEN_MODEL = 'gemini-2.0-flash';
+
+// ─── FITNESS OBJECTIVES CONFIG ────────────────────────────────────────────────
 const FITNESS_OBJECTIVES = [
   {
     id: 'lose_weight',
@@ -59,8 +78,8 @@ const FITNESS_OBJECTIVES = [
     colorClass: 'bg-orange-500',
     softClass: 'bg-orange-50 border-orange-200 text-orange-700',
     activeClass: 'bg-orange-500 border-orange-500 text-white shadow-orange-200',
-    kcalModifier: -400,
-    proteinMultiplier: 2.2,
+    kcalModifier: -400,       // deficit from TDEE
+    proteinMultiplier: 2.2,   // g per kg bodyweight
     exerciseFocus: 'HIIT + Moderate Cardio + Compound Lifts',
   },
   {
@@ -91,89 +110,112 @@ const FITNESS_OBJECTIVES = [
   },
 ];
 
-// ─────────────────────────────────────────────────────────────
-//  UTILITIES
-// ─────────────────────────────────────────────────────────────
-
-/** Extract a valid JSON object/array from any raw LLM string. */
+// ─── Robust JSON Extractor ────────────────────────────────────────────────────
+// Handles: ```json ... ```, ``` ... ```, plain JSON, JSON buried in prose
 function extractJson(raw) {
-  if (!raw) throw new Error('Empty AI response');
+  if (!raw) throw new Error('Empty response');
 
-  // Strip markdown code fences
+  // 1. Try stripping any markdown code fence (```json, ```JSON, ```, etc.)
   const fenceMatch = raw.match(/```(?:json|JSON)?\s*([\s\S]*?)```/);
   if (fenceMatch) {
-    try { return JSON.parse(fenceMatch[1].trim()); } catch (_) { /* continue */ }
+    const candidate = fenceMatch[1].trim();
+    try { return JSON.parse(candidate); } catch (_) { /* fall through */ }
   }
 
-  // Try whole string
-  try { return JSON.parse(raw.trim()); } catch (_) { /* continue */ }
+  // 2. Try parsing the whole string directly (model returned clean JSON)
+  try { return JSON.parse(raw.trim()); } catch (_) { /* fall through */ }
 
-  // Find first { or [
-  const fb = raw.indexOf('{');
-  const fa = raw.indexOf('[');
+  // 3. Find the first { ... } or [ ... ] block in the string
+  const firstBrace  = raw.indexOf('{');
+  const firstBracket = raw.indexOf('[');
   let start = -1;
-  if (fb !== -1 && (fa === -1 || fb < fa)) start = fb;
-  else if (fa !== -1) start = fa;
+  if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) start = firstBrace;
+  else if (firstBracket !== -1) start = firstBracket;
 
   if (start !== -1) {
-    const end = Math.max(raw.lastIndexOf('}'), raw.lastIndexOf(']'));
+    const lastBrace  = raw.lastIndexOf('}');
+    const lastBracket = raw.lastIndexOf(']');
+    const end = Math.max(lastBrace, lastBracket);
     if (end > start) {
-      try { return JSON.parse(raw.slice(start, end + 1)); } catch (_) { /* continue */ }
+      try { return JSON.parse(raw.slice(start, end + 1)); } catch (_) { /* fall through */ }
     }
   }
 
-  throw new Error(`Cannot extract JSON from: ${raw.slice(0, 200)}…`);
+  throw new Error(`Could not extract valid JSON from response:\n${raw.slice(0, 200)}…`);
 }
 
-/**
- * FIX #1 — Normalise Food Vision response.
- * The Gemini prompt returns either:
- *   { totalNutrition: { calories, protein, carbs, fat }, items: [...] }
- * or the flat legacy format:
- *   { calories, protein, carbs, fat }
- * This function ensures the component always gets flat top-level numbers.
- */
-function normalizeMealAnalysis(parsed) {
-  if (!parsed || parsed.error) return parsed;
+// ─── OpenRouter Helper ────────────────────────────────────────────────────────
+async function callOpenRouter(prompt, systemInstruction = '') {
+  if (!OPENROUTER_KEY) throw new Error('OpenRouter API Key is missing in .env');
+  const messages = [];
+  if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
+  messages.push({ role: 'user', content: prompt });
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${OPENROUTER_KEY}`,
+      'HTTP-Referer': 'http://localhost:5173',
+      'X-Title': 'Nutri Track AI',
+    },
+    body: JSON.stringify({ model: 'google/gemini-2.0-flash-001', messages }),
+  });
+  if (!res.ok) throw new Error(`OpenRouter Error: ${res.status}`);
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || '';
+}
 
-  const tn = parsed.totalNutrition || {};
-  return {
-    dish:       parsed.dish     || 'Unknown Food Item',
-    serving:    parsed.serving  || '',
-    confidence: parsed.confidence || 'medium',
-    // Prefer totalNutrition values, fall back to flat, then 0
-    calories:   Number(tn.calories  ?? parsed.calories  ?? 0),
-    protein:    Number(tn.protein   ?? parsed.protein   ?? 0),
-    carbs:      Number(tn.carbs     ?? parsed.carbs     ?? 0),
-    fat:        Number(tn.fat       ?? parsed.fat       ?? 0),
-    // items: ensure each item also has flat numbers (some models nest them)
-    items: (parsed.items || []).map(item => ({
-      name:     item.name     || item.dish  || 'Item',
-      serving:  item.serving  || '1 serving',
-      calories: Number(item.calories ?? 0),
-      protein:  Number(item.protein  ?? 0),
-      carbs:    Number(item.carbs    ?? 0),
-      fat:      Number(item.fat      ?? 0),
-    })),
-    tips: parsed.tips || '',
+// ─── Gemini Helper ────────────────────────────────────────────────────────────
+async function callGemini(prompt, systemInstruction = '', imageData = null, isJson = false) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEN_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const parts = [{ text: prompt }];
+  if (imageData) {
+    parts.unshift({ inline_data: { mime_type: imageData.mimeType, data: imageData.data } });
+  }
+  const payload = {
+    contents: [{ parts }],
+    ...(systemInstruction && { system_instruction: { parts: [{ text: systemInstruction }] } }),
+    generationConfig: {
+      ...(isJson && { response_mime_type: 'application/json' }),
+      temperature: 0.4,
+    },
   };
+
+  const fetchWithRetry = async (retries = 0) => {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (response.status === 429) {
+        console.warn('Gemini limit reached. Switching to OpenRouter...');
+        const fallback = await callOpenRouter(prompt, systemInstruction);
+        return isJson ? extractJson(fallback) : fallback;
+      }
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Gemini API Error ${response.status}: ${errText}`);
+      }
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error('Empty response from Gemini');
+      // For JSON mode: return the already-parsed object so callers don't re-parse
+      if (isJson) return extractJson(text);
+      return text;
+    } catch (err) {
+      if (retries < 2 && !err.message.includes('429')) {
+        await new Promise(r => setTimeout(r, 2000));
+        return fetchWithRetry(retries + 1);
+      }
+      throw err;
+    }
+  };
+  return fetchWithRetry();
 }
 
-/**
- * FIX #2 — Build a guaranteed exercise-specific YouTube search URL.
- * Appends hard-coded suffixes so the result is always a tutorial video,
- * never a music video or unrelated content.
- */
-function buildYtUrl(exerciseName, queryFromGemini) {
-  // Use model query only as the exercise-name hint; enforce tutorial context
-  const base = queryFromGemini || exerciseName || 'exercise';
-  // Strip any accidental non-exercise words
-  const safe = base.replace(/(music|song|lyrics|vevo|official video)/gi, '').trim();
-  const forced = `${safe} proper form tutorial exercise correction`;
-  return `https://www.youtube.com/results?search_query=${encodeURIComponent(forced)}`;
-}
 
-// Resize an image File to base64 (≤ maxPx on longest side)
+// ─── Image Resize Helper ──────────────────────────────────────────────────────
 function resizeImageToBase64(file, maxPx = 1024) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -192,126 +234,48 @@ function resizeImageToBase64(file, maxPx = 1024) {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
       resolve({ data: dataUrl.split(',')[1], mimeType: 'image/jpeg' });
     };
-    img.onerror = () => reject(new Error('Image failed to load'));
+    img.onerror = () => reject(new Error('Image load failed'));
     img.src = url;
   });
 }
 
-// Extract a representative frame from a video File
+// ─── Extract Video Frame Helper ───────────────────────────────────────────────
 function extractVideoFrame(file, timeSec = 2) {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
-    const url   = URL.createObjectURL(file);
+    const url = URL.createObjectURL(file);
     video.preload = 'metadata';
     video.onloadeddata = () => {
       video.currentTime = Math.min(timeSec, video.duration * 0.3);
     };
     video.onseeked = () => {
-      const canvas  = document.createElement('canvas');
-      canvas.width  = Math.min(video.videoWidth, 1024);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.min(video.videoWidth, 1024);
       canvas.height = Math.round(video.videoHeight * (canvas.width / video.videoWidth));
       canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
       URL.revokeObjectURL(url);
       const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
       resolve({ data: dataUrl.split(',')[1], mimeType: 'image/jpeg' });
     };
-    video.onerror = () => reject(new Error('Video failed to load'));
+    video.onerror = () => reject(new Error('Video load failed'));
     video.src = url;
   });
 }
 
-// ─────────────────────────────────────────────────────────────
-//  AI CALLERS
-//  → In production: replace these with fetch('/api/gemini', ...)
-//    so the real API key stays on the server.
-// ─────────────────────────────────────────────────────────────
-
-async function callOpenRouter(prompt, systemInstruction = '') {
-  if (!OPENROUTER_KEY) throw new Error('OpenRouter key missing in .env');
-  const messages = [];
-  if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
-  messages.push({ role: 'user', content: prompt });
-
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${OPENROUTER_KEY}`,
-      'HTTP-Referer':  window.location.origin,
-      'X-Title':       'Nutri Track AI',
-    },
-    body: JSON.stringify({ model: 'google/gemini-2.0-flash-001', messages }),
-  });
-  if (!res.ok) throw new Error(`OpenRouter ${res.status}`);
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || '';
+// ─── Gemini Vision Helper ─────────────────────────────────────────────────────
+async function callGeminiVision(prompt, systemInstruction = '', imageData = null, isJson = false) {
+  return callGemini(prompt, systemInstruction, imageData, isJson);
 }
 
-async function callGemini(prompt, systemInstruction = '', imageData = null, isJson = false) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEN_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
-  const parts = [{ text: prompt }];
-  if (imageData) {
-    // Vision: image must come BEFORE the text prompt
-    parts.unshift({ inline_data: { mime_type: imageData.mimeType, data: imageData.data } });
-  }
-
-  const payload = {
-    contents: [{ parts }],
-    ...(systemInstruction && { system_instruction: { parts: [{ text: systemInstruction }] } }),
-    generationConfig: {
-      ...(isJson && { response_mime_type: 'application/json' }),
-      temperature: 0.3,   // lower = more deterministic / accurate
-    },
-  };
-
-  const attempt = async (retries = 0) => {
-    const response = await fetch(url, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-    });
-
-    if (response.status === 429) {
-      console.warn('Gemini rate-limit → falling back to OpenRouter');
-      const fallback = await callOpenRouter(prompt, systemInstruction);
-      return isJson ? extractJson(fallback) : fallback;
-    }
-
-    if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`Gemini ${response.status}: ${err}`);
-    }
-
-    const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Empty response from Gemini');
-    return isJson ? extractJson(text) : text;
-  };
-
-  // Retry up to 2× on transient failures (not rate-limit)
-  for (let i = 0; i < 3; i++) {
-    try {
-      return await attempt(i);
-    } catch (err) {
-      if (i === 2 || err.message.includes('429')) throw err;
-      await new Promise(r => setTimeout(r, 2000 * (i + 1)));
-    }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  COMPONENTS
-// ─────────────────────────────────────────────────────────────
-
+// ─── NavBar ───────────────────────────────────────────────────────────────────
 const NavBar = ({ activeTab, setActiveTab, onLogout }) => {
   const navItems = [
-    { id: 'home',      icon: Home,            label: 'Home'        },
-    { id: 'dietetics', icon: Calculator,      label: 'Dietetics'   },
-    { id: 'scanner',   icon: Camera,          label: 'Food Vision' },
-    { id: 'workout',   icon: Dumbbell,        label: 'Workouts'    },
-    { id: 'rehab',     icon: Stethoscope,     label: 'Rehab'       },
-    { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard'   },
+    { id: 'home',      icon: Home,            label: 'Home'       },
+    { id: 'dietetics', icon: Calculator,      label: 'Dietetics'  },
+    { id: 'scanner',   icon: Camera,          label: 'Food Vision'},
+    { id: 'workout',   icon: Dumbbell,        label: 'Workouts'   },
+    { id: 'rehab',     icon: Stethoscope,     label: 'Rehab'      },
+    { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard'  },
   ];
   return (
     <nav className="bg-white border-b border-slate-100 sticky top-0 z-50">
@@ -336,7 +300,8 @@ const NavBar = ({ activeTab, setActiveTab, onLogout }) => {
                 activeTab === id ? 'bg-green-50 text-green-600' : 'text-slate-500 hover:bg-slate-50'
               }`}
             >
-              <Icon size={16} /> {label}
+              <Icon size={16} />
+              {label}
             </button>
           ))}
         </div>
@@ -351,6 +316,7 @@ const NavBar = ({ activeTab, setActiveTab, onLogout }) => {
   );
 };
 
+// ─── Objective Selector Component ─────────────────────────────────────────────
 const ObjectiveSelector = ({ fitnessObjective, setFitnessObjective }) => (
   <div className="mb-6">
     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 block flex items-center gap-2">
@@ -376,24 +342,39 @@ const ObjectiveSelector = ({ fitnessObjective, setFitnessObjective }) => (
   </div>
 );
 
+// ─── Exercise Protocol Display ────────────────────────────────────────────────
 const ExerciseProtocolCard = ({ workoutPlan, objectiveId }) => {
   const obj = FITNESS_OBJECTIVES.find(o => o.id === objectiveId) || FITNESS_OBJECTIVES[2];
+  const { colorClass } = obj;
+
   if (!workoutPlan) return null;
+
   return (
     <div className="bg-slate-900 rounded-[40px] p-10 text-white shadow-2xl mt-8">
       <div className="flex items-center gap-3 mb-2">
-        <div className={`w-8 h-8 ${obj.colorClass} rounded-xl flex items-center justify-center`}>
+        <div className={`w-8 h-8 ${colorClass} rounded-xl flex items-center justify-center`}>
           <Swords size={16} className="text-white" />
         </div>
         <h3 className="text-2xl font-black text-white uppercase tracking-tight">Exercise Protocol</h3>
       </div>
-      <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mb-8">{workoutPlan.focus}</p>
+      <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mb-8">
+        {workoutPlan.focus}
+      </p>
       <div className="grid grid-cols-1 md:grid-cols-7 gap-3">
         {(workoutPlan.weeklyRoutine || []).map((day, i) => (
-          <div key={i} className="bg-white/5 rounded-2xl p-4 border border-white/10 hover:border-white/20 transition-all">
-            <p className={`text-[9px] font-black uppercase tracking-widest mb-2 text-${obj.color}-400`}>{day.day}</p>
+          <div
+            key={i}
+            className="bg-white/5 rounded-2xl p-4 border border-white/10 hover:border-white/20 transition-all"
+          >
+            <p className={`text-[9px] font-black uppercase tracking-widest mb-2 text-${obj.color}-400`}>
+              {day.day}
+            </p>
             <p className="text-[11px] text-slate-300 leading-snug font-medium">{day.activity}</p>
-            {day.sets && <p className="text-[9px] text-slate-500 mt-2 font-bold">{day.sets}</p>}
+            {day.sets && (
+              <p className="text-[9px] text-slate-500 mt-2 font-bold">
+                {day.sets}
+              </p>
+            )}
           </div>
         ))}
       </div>
@@ -407,6 +388,7 @@ const ExerciseProtocolCard = ({ workoutPlan, objectiveId }) => {
   );
 };
 
+// ─── DietPlan Display ─────────────────────────────────────────────────────────
 const DAYS  = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 const MEALS = ['Breakfast','Morning Snack','Lunch','Afternoon Snack','Dinner','Supper'];
 
@@ -437,15 +419,30 @@ const DietPlanGrid = ({ dietPlan, dietPreference, fitnessObjective }) => {
                   dayData[meal.toLowerCase().replace(' ', '_')] ||
                   dayData[meal.replace(' ', '')] || '';
                 if (!value) return null;
+                const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
                 return (
                   <div key={meal} className="mb-3">
                     <p className="text-[9px] font-black text-slate-400 uppercase">{meal}</p>
-                    <p className="text-[11px] text-slate-700 leading-tight">
-                      {typeof value === 'object' ? JSON.stringify(value) : String(value)}
-                    </p>
+                    <p className="text-[11px] text-slate-700 leading-tight">{text}</p>
                   </div>
                 );
               })}
+              {Object.entries(dayData)
+                .filter(([k]) =>
+                  !MEALS.some(m =>
+                    k === m || k === m.toLowerCase() ||
+                    k === m.replace(' ', '_') || k === m.toLowerCase().replace(' ', '_') ||
+                    k === m.replace(' ', '')
+                  )
+                )
+                .map(([k, v]) => (
+                  <div key={k} className="mb-3">
+                    <p className="text-[9px] font-black text-slate-400 uppercase">{k}</p>
+                    <p className="text-[11px] text-slate-700 leading-tight">
+                      {typeof v === 'object' ? JSON.stringify(v) : String(v)}
+                    </p>
+                  </div>
+                ))}
             </div>
           );
         })}
@@ -454,8 +451,9 @@ const DietPlanGrid = ({ dietPlan, dietPreference, fitnessObjective }) => {
   );
 };
 
+// ─── Protocol Summary Banner ──────────────────────────────────────────────────
 const ProtocolSummaryBanner = ({ bmiResult, fitnessObjective, targetKcal, targetProtein }) => {
-  const obj  = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
+  const obj = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
   const Icon = obj.icon;
   return (
     <div className={`rounded-3xl p-6 border-2 mb-6 flex flex-wrap gap-6 items-center ${obj.softClass}`}>
@@ -487,19 +485,23 @@ const ProtocolSummaryBanner = ({ bmiResult, fitnessObjective, targetKcal, target
   );
 };
 
+// ─── DashboardTab ─────────────────────────────────────────────────────────────
 const DashboardTab = ({ workouts, userIsAnonymous }) => {
   const weeklyIntensity = workouts.reduce(
-    (acc, w) => acc + (Number(w.weight) || 0) * (Number(w.reps) || 0), 0
+    (acc, curr) => acc + (Number(curr.weight) || 0) * (Number(curr.reps) || 0), 0
   );
   const calculate1RM = () => {
     if (!workouts.length) return '--';
-    const { weight: wt, reps: r } = workouts[0];
-    const wn = Number(wt) || 0, rn = Number(r) || 0;
-    return rn === 0 ? wn : Math.round(wn * (1 + rn / 30));
+    const { weight: w, reps: r } = workouts[0];
+    const wn = Number(w) || 0;
+    const rn = Number(r) || 0;
+    if (rn === 0) return wn;
+    return Math.round(wn * (1 + rn / 30));
   };
-  const formatDate = ts => ts?.seconds
-    ? new Date(ts.seconds * 1000).toLocaleDateString() : 'N/A';
-
+  const formatDate = ts => {
+    if (!ts?.seconds) return 'N/A';
+    return new Date(ts.seconds * 1000).toLocaleDateString();
+  };
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">
       <div className="bg-white rounded-[40px] p-10 border border-slate-100 mb-8 shadow-sm flex items-center justify-between">
@@ -521,10 +523,10 @@ const DashboardTab = ({ workouts, userIsAnonymous }) => {
       </div>
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
         {[
-          { label: 'Total Volume',  value: `${weeklyIntensity} kg` },
-          { label: 'Total Lifts',   value: workouts.length },
-          { label: 'Status',        value: userIsAnonymous ? 'Guest' : 'Member', green: true },
-          { label: 'Last Activity', value: formatDate(workouts[0]?.timestamp) },
+          { label: 'Total Volume',   value: `${weeklyIntensity} kg` },
+          { label: 'Total Lifts',    value: workouts.length },
+          { label: 'Status',         value: userIsAnonymous ? 'Guest' : 'Member', green: true },
+          { label: 'Last Activity',  value: formatDate(workouts[0]?.timestamp) },
         ].map(({ label, value, green }) => (
           <div key={label} className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm text-center">
             <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">{label}</p>
@@ -536,27 +538,40 @@ const DashboardTab = ({ workouts, userIsAnonymous }) => {
   );
 };
 
+// ─── HealthTab ────────────────────────────────────────────────────────────────
 const HealthTab = ({
-  bmiHeight, setBmiHeight, bmiWeight, setBmiWeight, age, setAge, pal, setPal,
-  conditions, setConditions, dietPreference, setDietPreference,
-  fitnessObjective, setFitnessObjective, calculateBMI, bmiResult,
-  generateProtocol, isGeneratingDiet, dietPlan, workoutPlan,
-  dietError, targetKcal, targetProtein,
+  bmiHeight, setBmiHeight, bmiWeight, setBmiWeight,
+  age, setAge, pal, setPal,
+  conditions, setConditions,
+  dietPreference, setDietPreference,
+  fitnessObjective, setFitnessObjective,
+  calculateBMI, bmiResult,
+  generateProtocol, isGeneratingDiet,
+  dietPlan, workoutPlan,
+  dietError,
+  targetKcal, targetProtein,
 }) => (
   <div className="max-w-6xl mx-auto px-4 py-12">
     <div className="text-center mb-12">
       <h2 className="text-4xl font-extrabold text-slate-900 mb-4 uppercase italic">Protocol Synthesis</h2>
       <p className="text-slate-500">Biometric mapping → coordinated diet & exercise protocol.</p>
     </div>
+
     <div className="grid md:grid-cols-2 gap-8 mb-4">
-      {/* Left — inputs */}
+      {/* Left Card */}
       <div className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-sm">
         <h3 className="text-xl font-bold text-slate-900 mb-6 flex items-center gap-2">
           <User size={20} className="text-green-500" /> Profile Input
         </h3>
+
+        {/* Fitness Objective */}
         <ObjectiveSelector fitnessObjective={fitnessObjective} setFitnessObjective={setFitnessObjective} />
+
+        {/* Diet preference */}
         <div className="mb-6">
-          <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 block">Dietary Preference</label>
+          <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 block">
+            Dietary Preference
+          </label>
           <div className="grid grid-cols-2 gap-4">
             {[
               { val: 'veg',     label: 'Vegetarian',     Icon: Leaf, active: 'bg-green-500 border-green-500' },
@@ -574,6 +589,8 @@ const HealthTab = ({
             ))}
           </div>
         </div>
+
+        {/* Numeric inputs */}
         <div className="grid grid-cols-2 gap-4 mb-6">
           {[
             { label: 'Height (cm)', val: bmiHeight, set: setBmiHeight },
@@ -604,13 +621,17 @@ const HealthTab = ({
             </select>
           </div>
         </div>
+
+        {/* Clinical conditions */}
         <div className="mb-6">
           <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 block">Clinical Conditions</label>
           <div className="flex flex-wrap gap-2">
             {['CVD', 'T2D', 'Iron Deficiency', 'Hyperthyroid'].map(c => (
               <button
                 key={c}
-                onClick={() => setConditions(prev => prev.includes(c) ? prev.filter(x => x !== c) : [...prev, c])}
+                onClick={() =>
+                  setConditions(prev => prev.includes(c) ? prev.filter(x => x !== c) : [...prev, c])
+                }
                 className={`px-4 py-2 rounded-full text-xs font-bold transition-all ${
                   conditions.includes(c) ? 'bg-red-500 text-white shadow-lg' : 'bg-slate-50 text-slate-400 border border-slate-100'
                 }`}
@@ -620,6 +641,7 @@ const HealthTab = ({
             ))}
           </div>
         </div>
+
         <button
           onClick={calculateBMI}
           className="w-full py-4 bg-green-500 text-white rounded-2xl font-bold shadow-lg shadow-green-100 hover:bg-green-600 transition-all"
@@ -628,10 +650,11 @@ const HealthTab = ({
         </button>
       </div>
 
-      {/* Right — results */}
+      {/* Right Card */}
       <div className="bg-slate-900 rounded-[40px] p-8 text-white shadow-2xl flex flex-col justify-center">
         {bmiResult ? (
           <div className="text-center">
+            {/* Objective Badge */}
             {(() => {
               const obj = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective);
               const ObjIcon = obj?.icon;
@@ -641,6 +664,7 @@ const HealthTab = ({
                 </div>
               );
             })()}
+
             <div className="flex justify-center gap-6 mb-6 flex-wrap">
               <div>
                 <p className="text-5xl font-black text-green-400">{bmiResult.bmi}</p>
@@ -655,15 +679,20 @@ const HealthTab = ({
                 <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mt-1">Protein / day</p>
               </div>
             </div>
+
             <p className="text-xl font-bold mb-1 text-slate-300">
               Status: <span className="text-white">{bmiResult.category}</span>
             </p>
             <p className="text-xs font-black uppercase text-slate-500 tracking-[0.2em] mb-6">
               {dietPreference.toUpperCase()} · {FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective)?.label.toUpperCase()}
             </p>
+
             {dietError && (
-              <p className="text-red-400 text-xs font-bold mb-4 bg-red-900/30 p-3 rounded-xl">⚠ {dietError}</p>
+              <p className="text-red-400 text-xs font-bold mb-4 bg-red-900/30 p-3 rounded-xl">
+                ⚠ {dietError}
+              </p>
             )}
+
             <button
               onClick={generateProtocol}
               disabled={isGeneratingDiet}
@@ -692,6 +721,7 @@ const HealthTab = ({
       </div>
     </div>
 
+    {/* Protocol outputs */}
     {bmiResult && dietPlan && (
       <ProtocolSummaryBanner
         bmiResult={bmiResult}
@@ -700,102 +730,99 @@ const HealthTab = ({
         targetProtein={targetProtein}
       />
     )}
-    {dietPlan    && <DietPlanGrid dietPlan={dietPlan} dietPreference={dietPreference} fitnessObjective={fitnessObjective} />}
-    {workoutPlan && <ExerciseProtocolCard workoutPlan={workoutPlan} objectiveId={fitnessObjective} />}
+    {dietPlan && (
+      <DietPlanGrid dietPlan={dietPlan} dietPreference={dietPreference} fitnessObjective={fitnessObjective} />
+    )}
+    {workoutPlan && (
+      <ExerciseProtocolCard workoutPlan={workoutPlan} objectiveId={fitnessObjective} />
+    )}
   </div>
 );
 
-// ─── ScannerTab ───────────────────────────────────────────────
-const ScannerTab = ({ analyzeMealImage, isMealAnalyzing, mealAnalysis, previewUrl }) => (
-  <div className="bg-white p-10 rounded-[50px] border border-slate-100 shadow-sm">
-    <div className="flex items-center gap-3 mb-2">
-      <div className="w-10 h-10 bg-green-500 rounded-xl flex items-center justify-center shadow-md">
-        <Camera size={20} className="text-white" />
-      </div>
-      <div>
-        <h2 className="text-2xl font-black text-slate-900 italic uppercase tracking-tight">Food Vision</h2>
-        <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">AI Nutritional Scanner</p>
-      </div>
-    </div>
-    <p className="text-slate-400 text-sm mb-8 ml-1">Scan any meal — get instant macros with Indian food precision.</p>
-
-    {/* Upload zone */}
-    <label className="block w-full cursor-pointer bg-slate-50 rounded-[30px] border-4 border-dashed border-slate-200 hover:border-green-500 transition-all group mb-8 overflow-hidden">
-      <input type="file" accept="image/*" onChange={analyzeMealImage} className="hidden" />
-      {previewUrl ? (
-        <div className="relative">
-          <img src={previewUrl} alt="Food preview" className="w-full max-h-72 object-cover rounded-[26px]" />
-          <div className="absolute inset-0 bg-black/30 flex items-center justify-center rounded-[26px] opacity-0 group-hover:opacity-100 transition-all">
-            <p className="text-white font-black uppercase text-xs tracking-widest">Tap to Change Image</p>
-          </div>
+// ─── ScannerTab ───────────────────────────────────────────────────────────────
+const ScannerTab = ({ analyzeMealImage, isMealAnalyzing, mealAnalysis, previewUrl }) => {
+  return (
+    <div className="bg-white p-10 rounded-[50px] border border-slate-100 shadow-sm">
+      {/* Header */}
+      <div className="flex items-center gap-3 mb-2">
+        <div className="w-10 h-10 bg-green-500 rounded-xl flex items-center justify-center shadow-md">
+          <Camera size={20} className="text-white" />
         </div>
-      ) : (
-        <div className="p-16 flex flex-col items-center">
-          <div className="w-16 h-16 bg-green-50 rounded-2xl flex items-center justify-center mb-4 group-hover:bg-green-100 transition-all">
-            <Camera size={32} className="text-green-400 group-hover:text-green-600 transition-colors" />
+        <div>
+          <h2 className="text-2xl font-black text-slate-900 italic uppercase tracking-tight">Food Vision</h2>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">AI Nutritional Scanner</p>
+        </div>
+      </div>
+      <p className="text-slate-400 text-sm mb-8 ml-1">Scan any meal — get instant macros with Indian food precision.</p>
+
+      {/* Upload Zone */}
+      <label className="block w-full cursor-pointer bg-slate-50 rounded-[30px] border-4 border-dashed border-slate-200 hover:border-green-500 transition-all group mb-8 overflow-hidden">
+        <input type="file" accept="image/*" onChange={analyzeMealImage} className="hidden" />
+        {previewUrl ? (
+          <div className="relative">
+            <img src={previewUrl} alt="Food preview" className="w-full max-h-72 object-cover rounded-[26px]" />
+            <div className="absolute inset-0 bg-black/30 flex items-center justify-center rounded-[26px] opacity-0 group-hover:opacity-100 transition-all">
+              <p className="text-white font-black uppercase text-xs tracking-widest">Tap to Change Image</p>
+            </div>
           </div>
-          <p className="font-black text-slate-500 group-hover:text-green-600 uppercase text-xs tracking-widest mb-2">
-            {isMealAnalyzing ? '🔍 Scanning food...' : 'Upload Food Photo'}
-          </p>
-          <p className="text-[10px] text-slate-300 font-medium">Roti · Rice · Dal · Curry · Salad · Protein Bowls</p>
+        ) : (
+          <div className="p-16 flex flex-col items-center">
+            <div className="w-16 h-16 bg-green-50 rounded-2xl flex items-center justify-center mb-4 group-hover:bg-green-100 transition-all">
+              <Camera size={32} className="text-green-400 group-hover:text-green-600 transition-colors" />
+            </div>
+            <p className="font-black text-slate-500 group-hover:text-green-600 uppercase text-xs tracking-widest mb-2">
+              {isMealAnalyzing ? '🔍 Scanning food...' : 'Upload Food Photo'}
+            </p>
+            <p className="text-[10px] text-slate-300 font-medium">Works best with roti, rice, dal, curry, salad, protein bowls & more</p>
+          </div>
+        )}
+      </label>
+
+      {/* Analyzing State */}
+      {isMealAnalyzing && (
+        <div className="flex items-center justify-center gap-3 py-6 bg-green-50 rounded-2xl border border-green-100 mb-6">
+          <svg className="animate-spin h-5 w-5 text-green-500" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+          </svg>
+          <span className="text-green-700 font-black text-sm uppercase tracking-widest">Identifying dish & calculating macros...</span>
         </div>
       )}
-    </label>
 
-    {/* Loader */}
-    {isMealAnalyzing && (
-      <div className="flex items-center justify-center gap-3 py-6 bg-green-50 rounded-2xl border border-green-100 mb-6">
-        <svg className="animate-spin h-5 w-5 text-green-500" viewBox="0 0 24 24" fill="none">
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-        </svg>
-        <span className="text-green-700 font-black text-sm uppercase tracking-widest">Identifying dish & calculating macros…</span>
-      </div>
-    )}
-
-    {/* Error state */}
-    {mealAnalysis?.error && !isMealAnalyzing && (
-      <div className="bg-red-50 border border-red-100 rounded-[20px] p-6 text-center">
-        <p className="text-red-500 font-black text-sm uppercase tracking-widest mb-1">⚠ {mealAnalysis.error}</p>
-        <p className="text-red-400 text-xs font-medium">{mealAnalysis.message}</p>
-      </div>
-    )}
-
-    {/* Results */}
-    {mealAnalysis && !mealAnalysis.error && !isMealAnalyzing && (
-      <div className="space-y-6">
-        {/* Banner */}
-        <div className="bg-slate-900 rounded-[30px] p-6 flex items-center gap-4">
-          <div className="w-12 h-12 bg-green-500 rounded-xl flex items-center justify-center flex-shrink-0">
-            <Sparkles size={24} className="text-white" />
-          </div>
-          <div>
-            <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Food Vision Identified</p>
-            <p className="text-xl font-black text-white capitalize">{mealAnalysis.dish}</p>
-            {mealAnalysis.serving && (
-              <p className="text-xs text-green-400 font-bold mt-0.5">{mealAnalysis.serving}</p>
-            )}
-          </div>
-        </div>
-
-        {/* Macro cards */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          {[
-            { label: 'Calories', value: mealAnalysis.calories, unit: 'kcal', bg: 'bg-orange-50', border: 'border-orange-100', text: 'text-orange-600', sub: 'text-orange-400' },
-            { label: 'Protein',  value: mealAnalysis.protein,  unit: 'g',    bg: 'bg-blue-50',   border: 'border-blue-100',   text: 'text-blue-600',   sub: 'text-blue-400' },
-            { label: 'Carbs',    value: mealAnalysis.carbs,    unit: 'g',    bg: 'bg-purple-50', border: 'border-purple-100', text: 'text-purple-600', sub: 'text-purple-400' },
-            { label: 'Fat',      value: mealAnalysis.fat,      unit: 'g',    bg: 'bg-green-50',  border: 'border-green-100',  text: 'text-green-600',  sub: 'text-green-400' },
-          ].map(({ label, value, unit, bg, border, text, sub }) => (
-            <div key={label} className={`${bg} ${border} border rounded-[20px] p-5 text-center`}>
-              <p className={`text-3xl font-black ${text}`}>{value}</p>
-              <p className={`text-[9px] font-black uppercase tracking-widest ${sub} mt-0.5`}>{unit}</p>
-              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mt-1">{label}</p>
+      {/* Results — Rich Table View */}
+      {mealAnalysis && !isMealAnalyzing && (
+        <div className="space-y-6">
+          {/* Banner */}
+          <div className="bg-slate-900 rounded-[30px] p-6 flex items-center gap-4">
+            <div className="w-12 h-12 bg-green-500 rounded-xl flex items-center justify-center flex-shrink-0">
+              <Sparkles size={24} className="text-white" />
             </div>
-          ))}
-        </div>
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Food Vision Identified</p>
+              <p className="text-xl font-black text-white capitalize">{mealAnalysis.dish || 'Unknown Dish'}</p>
+              {mealAnalysis.serving && (
+                <p className="text-xs text-green-400 font-bold mt-0.5">{mealAnalysis.serving}</p>
+              )}
+            </div>
+          </div>
 
-        {/* Breakdown table */}
-        {mealAnalysis.items && mealAnalysis.items.length > 0 && (
+          {/* Macro Cards */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {[
+              { label: 'Calories', value: `${mealAnalysis.calories || 0}`, unit: 'kcal', color: 'orange', bg: 'bg-orange-50', border: 'border-orange-100', text: 'text-orange-600', sub: 'text-orange-400' },
+              { label: 'Protein',  value: `${mealAnalysis.protein || 0}`,  unit: 'g',    color: 'blue',   bg: 'bg-blue-50',   border: 'border-blue-100',   text: 'text-blue-600',   sub: 'text-blue-400' },
+              { label: 'Carbs',    value: `${mealAnalysis.carbs || 0}`,    unit: 'g',    color: 'purple', bg: 'bg-purple-50', border: 'border-purple-100', text: 'text-purple-600', sub: 'text-purple-400' },
+              { label: 'Fat',      value: `${mealAnalysis.fat || 0}`,      unit: 'g',    color: 'green',  bg: 'bg-green-50',  border: 'border-green-100',  text: 'text-green-600',  sub: 'text-green-400' },
+            ].map(({ label, value, unit, bg, border, text, sub }) => (
+              <div key={label} className={`${bg} ${border} border rounded-[20px] p-5 text-center`}>
+                <p className={`text-3xl font-black ${text}`}>{value}</p>
+                <p className={`text-[9px] font-black uppercase tracking-widest ${sub} mt-0.5`}>{unit}</p>
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mt-1">{label}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Detailed Nutrition Table */}
           <div className="bg-white border border-slate-100 rounded-[25px] overflow-hidden shadow-sm">
             <div className="bg-slate-50 px-6 py-3 border-b border-slate-100">
               <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Nutritional Breakdown</p>
@@ -812,263 +839,257 @@ const ScannerTab = ({ analyzeMealImage, isMealAnalyzing, mealAnalysis, previewUr
                 </tr>
               </thead>
               <tbody>
-                {mealAnalysis.items.map((item, i) => (
+                {(mealAnalysis.items || [{ name: mealAnalysis.dish, serving: mealAnalysis.serving || '1 serving', calories: mealAnalysis.calories, protein: mealAnalysis.protein, carbs: mealAnalysis.carbs, fat: mealAnalysis.fat }]).map((item, i) => (
                   <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-slate-50/50'}>
-                    <td className="px-6 py-4 font-bold text-slate-800 capitalize">{item.name}</td>
-                    <td className="px-4 py-4 text-center text-slate-500 font-medium text-xs">{item.serving}</td>
-                    <td className="px-4 py-4 text-center font-black text-orange-600">{item.calories} <span className="text-[9px] font-bold text-slate-400">kcal</span></td>
-                    <td className="px-4 py-4 text-center font-black text-blue-600">{item.protein}<span className="text-[9px] font-bold text-slate-400">g</span></td>
-                    <td className="px-4 py-4 text-center font-black text-purple-600">{item.carbs}<span className="text-[9px] font-bold text-slate-400">g</span></td>
-                    <td className="px-4 py-4 text-center font-black text-green-600">{item.fat}<span className="text-[9px] font-bold text-slate-400">g</span></td>
+                    <td className="px-6 py-4 font-bold text-slate-800 capitalize">{item.name || item.dish || mealAnalysis.dish}</td>
+                    <td className="px-4 py-4 text-center text-slate-500 font-medium text-xs">{item.serving || '1 serving'}</td>
+                    <td className="px-4 py-4 text-center font-black text-orange-600">{item.calories || 0} <span className="text-[9px] font-bold text-slate-400">kcal</span></td>
+                    <td className="px-4 py-4 text-center font-black text-blue-600">{item.protein || 0}<span className="text-[9px] font-bold text-slate-400">g</span></td>
+                    <td className="px-4 py-4 text-center font-black text-purple-600">{item.carbs || 0}<span className="text-[9px] font-bold text-slate-400">g</span></td>
+                    <td className="px-4 py-4 text-center font-black text-green-600">{item.fat || 0}<span className="text-[9px] font-bold text-slate-400">g</span></td>
                   </tr>
                 ))}
                 {/* Total row */}
                 <tr className="border-t-2 border-slate-200 bg-slate-900">
                   <td className="px-6 py-4 font-black text-white uppercase text-xs tracking-widest" colSpan={2}>Total Estimate</td>
-                  <td className="px-4 py-4 text-center font-black text-orange-400">{mealAnalysis.calories} <span className="text-[9px] font-bold text-orange-600">kcal</span></td>
-                  <td className="px-4 py-4 text-center font-black text-blue-400">{mealAnalysis.protein}<span className="text-[9px] font-bold text-blue-600">g</span></td>
-                  <td className="px-4 py-4 text-center font-black text-purple-400">{mealAnalysis.carbs}<span className="text-[9px] font-bold text-purple-600">g</span></td>
-                  <td className="px-4 py-4 text-center font-black text-green-400">{mealAnalysis.fat}<span className="text-[9px] font-bold text-green-600">g</span></td>
+                  <td className="px-4 py-4 text-center font-black text-orange-400">{mealAnalysis.calories || 0} <span className="text-[9px] font-bold text-orange-600">kcal</span></td>
+                  <td className="px-4 py-4 text-center font-black text-blue-400">{mealAnalysis.protein || 0}<span className="text-[9px] font-bold text-blue-600">g</span></td>
+                  <td className="px-4 py-4 text-center font-black text-purple-400">{mealAnalysis.carbs || 0}<span className="text-[9px] font-bold text-purple-600">g</span></td>
+                  <td className="px-4 py-4 text-center font-black text-green-400">{mealAnalysis.fat || 0}<span className="text-[9px] font-bold text-green-600">g</span></td>
                 </tr>
               </tbody>
             </table>
           </div>
-        )}
 
-        {/* Tips */}
-        {mealAnalysis.tips && (
-          <div className="bg-green-50 border border-green-100 rounded-[20px] p-5">
-            <p className="text-[10px] font-black uppercase tracking-widest text-green-500 mb-2">💡 Dietitian Note</p>
-            <p className="text-sm text-green-800 font-medium leading-relaxed">{mealAnalysis.tips}</p>
-          </div>
-        )}
-
-        {/* Scan again */}
-        <label className="block w-full cursor-pointer">
-          <input type="file" accept="image/*" onChange={analyzeMealImage} className="hidden" />
-          <div className="w-full py-4 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-2xl font-black uppercase tracking-widest text-center text-sm transition-all cursor-pointer">
-            📷 Scan Another Meal
-          </div>
-        </label>
-      </div>
-    )}
-  </div>
-);
-
-// ─── RehabTab ─────────────────────────────────────────────────
-const RehabTab = ({ analyzeFormVision, isFormAnalyzing, formFeedback, rehabPreviewUrl, rehabFileType }) => (
-  <div className="max-w-4xl mx-auto px-4">
-    <div className="bg-white p-10 rounded-[50px] border border-slate-100 shadow-sm">
-      <div className="flex items-center gap-3 mb-2">
-        <div className="w-10 h-10 bg-blue-500 rounded-xl flex items-center justify-center shadow-md">
-          <Stethoscope size={20} className="text-white" />
-        </div>
-        <div>
-          <h2 className="text-2xl font-black text-slate-900 italic uppercase tracking-tight">AI Form Expert</h2>
-          <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Biomechanical Analysis · Rehab Coach</p>
-        </div>
-      </div>
-      <p className="text-slate-400 text-sm mb-8 ml-1">
-        Upload a photo or video of your exercise — get expert form analysis + exercise tutorial links.
-      </p>
-
-      {/* Upload zone */}
-      <label className="block w-full cursor-pointer bg-slate-50 rounded-[30px] border-4 border-dashed border-slate-200 hover:border-blue-500 transition-all group mb-8 overflow-hidden">
-        <input type="file" accept="image/*,video/*" onChange={analyzeFormVision} className="hidden" />
-        {rehabPreviewUrl ? (
-          <div className="relative">
-            {rehabFileType === 'video' ? (
-              <video src={rehabPreviewUrl} className="w-full max-h-64 object-cover rounded-[26px]" muted playsInline />
-            ) : (
-              <img src={rehabPreviewUrl} alt="Exercise preview" className="w-full max-h-64 object-cover rounded-[26px]" />
-            )}
-            <div className="absolute inset-0 bg-black/30 flex items-center justify-center rounded-[26px] opacity-0 group-hover:opacity-100 transition-all">
-              <p className="text-white font-black uppercase text-xs tracking-widest">Tap to Change</p>
-            </div>
-            {rehabFileType === 'video' && (
-              <div className="absolute top-3 left-3 bg-blue-500 text-white text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full">
-                📹 Video — Frame Extracted
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="p-16 flex flex-col items-center">
-            <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mb-4 group-hover:bg-blue-100 transition-all">
-              <Activity size={32} className="text-blue-300 group-hover:text-blue-500 transition-colors" />
-            </div>
-            <p className="font-black text-slate-500 group-hover:text-blue-600 uppercase text-xs tracking-widest mb-2">
-              {isFormAnalyzing ? '🔬 Analyzing form…' : 'Upload Image or Video'}
-            </p>
-            <p className="text-[10px] text-slate-300 font-medium">Push-ups · Squats · Deadlifts · Planks · Any exercise</p>
-            <div className="flex gap-2 mt-3">
-              <span className="bg-blue-100 text-blue-500 text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full">📷 Photo</span>
-              <span className="bg-purple-100 text-purple-500 text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full">🎬 Video</span>
-            </div>
-          </div>
-        )}
-      </label>
-
-      {/* Loader */}
-      {isFormAnalyzing && (
-        <div className="flex items-center justify-center gap-3 py-6 bg-blue-50 rounded-2xl border border-blue-100 mb-6">
-          <svg className="animate-spin h-5 w-5 text-blue-500" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-          </svg>
-          <span className="text-blue-700 font-black text-sm uppercase tracking-widest">Analyzing biomechanics…</span>
-        </div>
-      )}
-
-      {/* Error / invalid content */}
-      {formFeedback?.error && !isFormAnalyzing && (
-        <div className="bg-red-50 border border-red-100 rounded-[20px] p-6 text-center">
-          <p className="text-red-500 font-black text-sm uppercase tracking-widest mb-1">⚠ {formFeedback.error}</p>
-          <p className="text-red-400 text-xs font-medium">{formFeedback.message}</p>
-        </div>
-      )}
-
-      {/* Structured feedback */}
-      {formFeedback && !formFeedback.error && !isFormAnalyzing && (
-        <div className="space-y-5">
-          {/* Exercise banner */}
-          {formFeedback.exercise && (
-            <div className="bg-slate-900 rounded-[25px] p-6 flex items-center gap-4">
-              <div className="w-12 h-12 bg-blue-500 rounded-xl flex items-center justify-center flex-shrink-0">
-                <Dumbbell size={24} className="text-white" />
-              </div>
-              <div>
-                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400">Exercise Identified</p>
-                <p className="text-xl font-black text-white capitalize">{formFeedback.exercise}</p>
-                {formFeedback.muscles && (
-                  <p className="text-xs text-blue-400 font-bold mt-0.5">{formFeedback.muscles}</p>
-                )}
-              </div>
+          {/* Health Tips */}
+          {mealAnalysis.tips && (
+            <div className="bg-green-50 border border-green-100 rounded-[20px] p-5">
+              <p className="text-[10px] font-black uppercase tracking-widest text-green-500 mb-2">💡 Dietitian Note</p>
+              <p className="text-sm text-green-800 font-medium leading-relaxed">{mealAnalysis.tips}</p>
             </div>
           )}
 
-          {/* Summary */}
-          {formFeedback.summary && (
-            <div className="bg-slate-50 rounded-[20px] p-5 border border-slate-100">
-              <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2 flex items-center gap-1">
-                <BrainCircuit size={10} /> What&apos;s Happening
-              </p>
-              <p className="text-sm text-slate-700 font-medium leading-relaxed">{formFeedback.summary}</p>
-            </div>
-          )}
-
-          {/* Good & Watch-outs */}
-          <div className="grid md:grid-cols-2 gap-4">
-            {formFeedback.good?.length > 0 && (
-              <div className="bg-green-50 rounded-[20px] p-5 border border-green-100">
-                <p className="text-[9px] font-black uppercase tracking-widest text-green-500 mb-3 flex items-center gap-1">
-                  <CheckCircle2 size={10} /> The Good
-                </p>
-                <ul className="space-y-2">
-                  {formFeedback.good.map((g, i) => (
-                    <li key={i} className="text-xs text-green-700 font-medium flex items-start gap-2">
-                      <span className="text-green-400 mt-0.5">✓</span> {g}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {formFeedback.watchouts?.length > 0 && (
-              <div className="bg-red-50 rounded-[20px] p-5 border border-red-100">
-                <p className="text-[9px] font-black uppercase tracking-widest text-red-500 mb-3 flex items-center gap-1">
-                  <AlertCircle size={10} /> Watch-Outs
-                </p>
-                <ul className="space-y-2">
-                  {formFeedback.watchouts.map((w, i) => (
-                    <li key={i} className="text-xs text-red-700 font-medium flex items-start gap-2">
-                      <span className="text-red-400 mt-0.5">⚠</span> {w}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
-
-          {/* Quick fixes */}
-          {formFeedback.fixes?.length > 0 && (
-            <div className="bg-yellow-50 rounded-[20px] p-5 border border-yellow-100">
-              <p className="text-[9px] font-black uppercase tracking-widest text-yellow-600 mb-3 flex items-center gap-1">
-                <Zap size={10} /> Quick Fixes
-              </p>
-              <ol className="space-y-2">
-                {formFeedback.fixes.map((f, i) => (
-                  <li key={i} className="text-xs text-yellow-800 font-medium flex items-start gap-2">
-                    <span className="text-yellow-500 font-black">{i + 1}.</span> {f}
-                  </li>
-                ))}
-              </ol>
-            </div>
-          )}
-
-          {/* Injury risks */}
-          {formFeedback.injuryRisks?.length > 0 && (
-            <div className="bg-orange-50 rounded-[20px] p-5 border border-orange-100">
-              <p className="text-[9px] font-black uppercase tracking-widest text-orange-500 mb-3 flex items-center gap-1">
-                <Shield size={10} /> Injury Risk Flags
-              </p>
-              <ul className="space-y-2">
-                {formFeedback.injuryRisks.map((r, i) => (
-                  <li key={i} className="text-xs text-orange-700 font-medium flex items-start gap-2">
-                    <span className="text-orange-400 mt-0.5">🔴</span> {r}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {/* YouTube tutorial links — FIX #2: buildYtUrl forces exercise context */}
-          {formFeedback.ytSuggestions?.length > 0 && (
-            <div className="bg-white border border-slate-100 rounded-[20px] p-5 shadow-sm">
-              <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-4 flex items-center gap-1">
-                <Activity size={10} className="text-red-500" /> Recommended Tutorial Videos
-              </p>
-              <div className="space-y-3">
-                {formFeedback.ytSuggestions.map((v, i) => (
-                  <a
-                    key={i}
-                    href={buildYtUrl(formFeedback.exercise, v.query)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-4 p-4 bg-slate-50 hover:bg-red-50 border border-slate-100 hover:border-red-200 rounded-2xl transition-all group"
-                  >
-                    <div className="w-10 h-10 bg-red-500 rounded-xl flex items-center justify-center flex-shrink-0 shadow-sm group-hover:scale-110 transition-all">
-                      <span className="text-white text-sm font-black">▶</span>
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-black text-slate-800 group-hover:text-red-600 transition-colors capitalize">{v.title}</p>
-                      <p className="text-[10px] text-slate-400 font-medium truncate">{v.reason}</p>
-                    </div>
-                    <ChevronRight size={14} className="text-slate-300 group-hover:text-red-400 flex-shrink-0 transition-colors" />
-                  </a>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Fallback plain-text */}
-          {typeof formFeedback === 'string' && (
-            <div className="bg-blue-50 p-8 rounded-[25px] text-sm text-blue-800 border border-blue-100 leading-relaxed">
-              <div className="whitespace-pre-wrap">{formFeedback}</div>
-            </div>
-          )}
-
-          {/* Analyse again */}
+          {/* Scan again button */}
           <label className="block w-full cursor-pointer">
-            <input type="file" accept="image/*,video/*" onChange={analyzeFormVision} className="hidden" />
+            <input type="file" accept="image/*" onChange={analyzeMealImage} className="hidden" />
             <div className="w-full py-4 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-2xl font-black uppercase tracking-widest text-center text-sm transition-all cursor-pointer">
-              🎬 Analyze Another Exercise
+              📷 Scan Another Meal
             </div>
           </label>
         </div>
       )}
     </div>
-  </div>
-);
+  );
+};
 
+// ─── RehabTab ─────────────────────────────────────────────────────────────────
+const RehabTab = ({ analyzeFormVision, isFormAnalyzing, formFeedback, rehabPreviewUrl, rehabFileType }) => {
+  return (
+    <div className="max-w-4xl mx-auto px-4">
+      <div className="bg-white p-10 rounded-[50px] border border-slate-100 shadow-sm">
+        {/* Header */}
+        <div className="flex items-center gap-3 mb-2">
+          <div className="w-10 h-10 bg-blue-500 rounded-xl flex items-center justify-center shadow-md">
+            <Stethoscope size={20} className="text-white" />
+          </div>
+          <div>
+            <h2 className="text-2xl font-black text-slate-900 italic uppercase tracking-tight">AI Form Expert</h2>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Biomechanical Analysis · Rehab Coach</p>
+          </div>
+        </div>
+        <p className="text-slate-400 text-sm mb-8 ml-1">Upload a photo or video of your exercise — get expert form analysis + YouTube suggestions.</p>
+
+        {/* Upload Zone — accepts image AND video */}
+        <label className="block w-full cursor-pointer bg-slate-50 rounded-[30px] border-4 border-dashed border-slate-200 hover:border-blue-500 transition-all group mb-8 overflow-hidden">
+          <input type="file" accept="image/*,video/*" onChange={analyzeFormVision} className="hidden" />
+          {rehabPreviewUrl ? (
+            <div className="relative">
+              {rehabFileType === 'video' ? (
+                <video src={rehabPreviewUrl} className="w-full max-h-64 object-cover rounded-[26px]" muted playsInline />
+              ) : (
+                <img src={rehabPreviewUrl} alt="Exercise preview" className="w-full max-h-64 object-cover rounded-[26px]" />
+              )}
+              <div className="absolute inset-0 bg-black/30 flex items-center justify-center rounded-[26px] opacity-0 group-hover:opacity-100 transition-all">
+                <p className="text-white font-black uppercase text-xs tracking-widest">Tap to Change</p>
+              </div>
+              {rehabFileType === 'video' && (
+                <div className="absolute top-3 left-3 bg-blue-500 text-white text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full">
+                  📹 Video — Frame Extracted
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="p-16 flex flex-col items-center">
+              <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mb-4 group-hover:bg-blue-100 transition-all">
+                <Activity size={32} className="text-blue-300 group-hover:text-blue-500 transition-colors" />
+              </div>
+              <p className="font-black text-slate-500 group-hover:text-blue-600 uppercase text-xs tracking-widest mb-2">
+                {isFormAnalyzing ? '🔬 Analyzing form...' : 'Upload Image or Video'}
+              </p>
+              <p className="text-[10px] text-slate-300 font-medium">Push-ups · Squats · Deadlifts · Planks · Any exercise</p>
+              <div className="flex gap-2 mt-3">
+                <span className="bg-blue-100 text-blue-500 text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full">📷 Photo</span>
+                <span className="bg-purple-100 text-purple-500 text-[9px] font-black uppercase tracking-widest px-3 py-1 rounded-full">🎬 Video</span>
+              </div>
+            </div>
+          )}
+        </label>
+
+        {/* Analyzing State */}
+        {isFormAnalyzing && (
+          <div className="flex items-center justify-center gap-3 py-6 bg-blue-50 rounded-2xl border border-blue-100 mb-6">
+            <svg className="animate-spin h-5 w-5 text-blue-500" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+            </svg>
+            <span className="text-blue-700 font-black text-sm uppercase tracking-widest">Analyzing biomechanics...</span>
+          </div>
+        )}
+
+        {/* Structured Form Feedback */}
+        {formFeedback && !isFormAnalyzing && (
+          <div className="space-y-5">
+            {/* Exercise ID Banner */}
+            {formFeedback.exercise && (
+              <div className="bg-slate-900 rounded-[25px] p-6 flex items-center gap-4">
+                <div className="w-12 h-12 bg-blue-500 rounded-xl flex items-center justify-center flex-shrink-0">
+                  <Dumbbell size={24} className="text-white" />
+                </div>
+                <div>
+                  <p className="text-[9px] font-black uppercase tracking-widest text-slate-400">Exercise Identified</p>
+                  <p className="text-xl font-black text-white capitalize">{formFeedback.exercise}</p>
+                  {formFeedback.muscles && (
+                    <p className="text-xs text-blue-400 font-bold mt-0.5">{formFeedback.muscles}</p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* What is Happening */}
+            {formFeedback.summary && (
+              <div className="bg-slate-50 rounded-[20px] p-5 border border-slate-100">
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2 flex items-center gap-1">
+                  <BrainCircuit size={10} /> What&apos;s Happening
+                </p>
+                <p className="text-sm text-slate-700 font-medium leading-relaxed">{formFeedback.summary}</p>
+              </div>
+            )}
+
+            {/* Good & Watch-Outs */}
+            <div className="grid md:grid-cols-2 gap-4">
+              {formFeedback.good && formFeedback.good.length > 0 && (
+                <div className="bg-green-50 rounded-[20px] p-5 border border-green-100">
+                  <p className="text-[9px] font-black uppercase tracking-widest text-green-500 mb-3 flex items-center gap-1">
+                    <CheckCircle2 size={10} /> The Good
+                  </p>
+                  <ul className="space-y-2">
+                    {formFeedback.good.map((g, i) => (
+                      <li key={i} className="text-xs text-green-700 font-medium flex items-start gap-2">
+                        <span className="text-green-400 mt-0.5">✓</span> {g}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {formFeedback.watchouts && formFeedback.watchouts.length > 0 && (
+                <div className="bg-red-50 rounded-[20px] p-5 border border-red-100">
+                  <p className="text-[9px] font-black uppercase tracking-widest text-red-500 mb-3 flex items-center gap-1">
+                    <AlertCircle size={10} /> Watch-Outs
+                  </p>
+                  <ul className="space-y-2">
+                    {formFeedback.watchouts.map((w, i) => (
+                      <li key={i} className="text-xs text-red-700 font-medium flex items-start gap-2">
+                        <span className="text-red-400 mt-0.5">⚠</span> {w}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Quick Fixes */}
+            {formFeedback.fixes && formFeedback.fixes.length > 0 && (
+              <div className="bg-yellow-50 rounded-[20px] p-5 border border-yellow-100">
+                <p className="text-[9px] font-black uppercase tracking-widest text-yellow-600 mb-3 flex items-center gap-1">
+                  <Zap size={10} /> Quick Fixes
+                </p>
+                <ol className="space-y-2">
+                  {formFeedback.fixes.map((f, i) => (
+                    <li key={i} className="text-xs text-yellow-800 font-medium flex items-start gap-2">
+                      <span className="text-yellow-500 font-black">{i+1}.</span> {f}
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+
+            {/* Injury Risks */}
+            {formFeedback.injuryRisks && formFeedback.injuryRisks.length > 0 && (
+              <div className="bg-orange-50 rounded-[20px] p-5 border border-orange-100">
+                <p className="text-[9px] font-black uppercase tracking-widest text-orange-500 mb-3 flex items-center gap-1">
+                  <Shield size={10} /> Injury Risk Flags
+                </p>
+                <ul className="space-y-2">
+                  {formFeedback.injuryRisks.map((r, i) => (
+                    <li key={i} className="text-xs text-orange-700 font-medium flex items-start gap-2">
+                      <span className="text-orange-400 mt-0.5">🔴</span> {r}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* YouTube Video Suggestions */}
+            {formFeedback.ytSuggestions && formFeedback.ytSuggestions.length > 0 && (
+              <div className="bg-white border border-slate-100 rounded-[20px] p-5 shadow-sm">
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-4 flex items-center gap-1">
+                  <Activity size={10} className="text-red-500" /> Recommended Tutorial Videos
+                </p>
+                <div className="space-y-3">
+                  {formFeedback.ytSuggestions.map((v, i) => (
+                    <a
+                      key={i}
+                      href={`https://www.youtube.com/results?search_query=${encodeURIComponent(v.query)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-4 p-4 bg-slate-50 hover:bg-red-50 border border-slate-100 hover:border-red-200 rounded-2xl transition-all group"
+                    >
+                      <div className="w-10 h-10 bg-red-500 rounded-xl flex items-center justify-center flex-shrink-0 shadow-sm group-hover:scale-110 transition-all">
+                        <span className="text-white text-sm font-black">▶</span>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-black text-slate-800 group-hover:text-red-600 transition-colors capitalize">{v.title}</p>
+                        <p className="text-[10px] text-slate-400 font-medium truncate">{v.reason}</p>
+                      </div>
+                      <ChevronRight size={14} className="text-slate-300 group-hover:text-red-400 flex-shrink-0 transition-colors" />
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Plain text fallback */}
+            {typeof formFeedback === 'string' && (
+              <div className="bg-blue-50 p-8 rounded-[25px] text-sm text-blue-800 border border-blue-100 leading-relaxed">
+                <div className="whitespace-pre-wrap">{formFeedback}</div>
+              </div>
+            )}
+
+            {/* Scan again */}
+            <label className="block w-full cursor-pointer">
+              <input type="file" accept="image/*,video/*" onChange={analyzeFormVision} className="hidden" />
+              <div className="w-full py-4 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-2xl font-black uppercase tracking-widest text-center text-sm transition-all cursor-pointer">
+                🎬 Analyze Another Exercise
+              </div>
+            </label>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ─── WorkoutTab ───────────────────────────────────────────────────────────────
 const WorkoutTab = ({
   handleWorkoutSubmit, exerciseName, setExerciseName,
   bodyPart, setBodyPart, weight, setWeight, reps, setReps, sets, setSets, workouts,
@@ -1124,14 +1145,21 @@ const WorkoutTab = ({
     <div className="mt-16 space-y-4">
       <h3 className="text-xs font-black text-slate-300 uppercase tracking-[0.5em] mb-6">Recent Lift Data</h3>
       {workouts.slice(0, 4).map(w => (
-        <div key={w.id} className="flex justify-between items-center p-6 bg-slate-50 rounded-3xl border border-slate-100 hover:border-green-300 transition-all">
+        <div
+          key={w.id}
+          className="flex justify-between items-center p-6 bg-slate-50 rounded-3xl border border-slate-100 hover:border-green-300 transition-all"
+        >
           <div>
-            <p className="font-black text-slate-900 uppercase text-sm tracking-tighter">{w.exercise || 'Unnamed'}</p>
+            <p className="font-black text-slate-900 uppercase text-sm tracking-tighter">{w.exercise || 'Unnamed Exercise'}</p>
             <p className="text-[10px] text-slate-400 font-bold uppercase">{w.bodyPart || 'Unspecified'}</p>
           </div>
           <div className="flex items-center gap-4">
-            <span className="bg-white px-4 py-2 rounded-xl text-xs font-black text-slate-900 border border-slate-100">{w.weight || 0} KG</span>
-            <span className="bg-green-500 px-4 py-2 rounded-xl text-xs font-black text-white">{w.reps || 0} R</span>
+            <span className="bg-white px-4 py-2 rounded-xl text-xs font-black text-slate-900 border border-slate-100">
+              {w.weight || 0} KG
+            </span>
+            <span className="bg-green-500 px-4 py-2 rounded-xl text-xs font-black text-white">
+              {w.reps || 0} R
+            </span>
           </div>
         </div>
       ))}
@@ -1139,85 +1167,82 @@ const WorkoutTab = ({
   </div>
 );
 
-// ─────────────────────────────────────────────────────────────
-//  MAIN APP
-// ─────────────────────────────────────────────────────────────
+// ─── Main App ─────────────────────────────────────────────────────────────────
 const App = () => {
-  const [activeTab,   setActiveTab]   = useState('home');
-  const [loading,     setLoading]     = useState(true);
-  const [user,        setUser]        = useState(null);
-  const [db,          setDb]          = useState(null);
-  const [auth,        setAuth]        = useState(null);
-  const [workouts,    setWorkouts]    = useState([]);
-  const [initError,   setInitError]   = useState('');
+  const [activeTab, setActiveTab] = useState('home');
+  const [loading, setLoading]     = useState(true);
+  const [user, setUser]           = useState(null);
+  const [db, setDb]               = useState(null);
+  const [auth, setAuth]           = useState(null);
+  const [workouts, setWorkouts]   = useState([]);
+  const [initError, setInitError] = useState('');
 
   // Auth
-  const [authView,  setAuthView]  = useState('login');
-  const [email,     setEmail]     = useState('');
-  const [password,  setPassword]  = useState('');
+  const [authView, setAuthView]   = useState('login');
+  const [email, setEmail]         = useState('');
+  const [password, setPassword]   = useState('');
   const [authError, setAuthError] = useState('');
 
   // Dietetics
-  const [bmiHeight,         setBmiHeight]         = useState('180');
-  const [bmiWeight,         setBmiWeight]         = useState('78');
-  const [age,               setAge]               = useState('22');
-  const [pal,               setPal]               = useState('1.55');
-  const [conditions,        setConditions]        = useState([]);
-  const [dietPreference,    setDietPreference]    = useState('veg');
-  const [fitnessObjective,  setFitnessObjective]  = useState('maintain');
-  const [bmiResult,         setBmiResult]         = useState(null);
-  const [weeklyDietPlan,    setWeeklyDietPlan]    = useState(null);
+  const [bmiHeight, setBmiHeight]               = useState('180');
+  const [bmiWeight, setBmiWeight]               = useState('78');
+  const [age, setAge]                           = useState('22');
+  const [pal, setPal]                           = useState('1.55');
+  const [conditions, setConditions]             = useState([]);
+  const [dietPreference, setDietPreference]     = useState('veg');
+  const [fitnessObjective, setFitnessObjective] = useState('maintain');
+  const [bmiResult, setBmiResult]               = useState(null);
+  const [weeklyDietPlan, setWeeklyDietPlan]     = useState(null);
   const [weeklyWorkoutPlan, setWeeklyWorkoutPlan] = useState(null);
-  const [isGeneratingDiet,  setIsGeneratingDiet]  = useState(false);
-  const [dietError,         setDietError]         = useState('');
-  const [targetKcal,        setTargetKcal]        = useState(null);
-  const [targetProtein,     setTargetProtein]     = useState(null);
+  const [isGeneratingDiet, setIsGeneratingDiet] = useState(false);
+  const [dietError, setDietError]               = useState('');
+  const [targetKcal, setTargetKcal]             = useState(null);
+  const [targetProtein, setTargetProtein]       = useState(null);
 
-  // Workout
+  // Workout form
   const [exerciseName, setExerciseName] = useState('');
-  const [bodyPart,     setBodyPart]     = useState('');
-  const [weight,       setWeight]       = useState('');
-  const [reps,         setReps]         = useState('');
-  const [sets,         setSets]         = useState('');
+  const [bodyPart, setBodyPart]         = useState('');
+  const [weight, setWeight]             = useState('');
+  const [reps, setReps]                 = useState('');
+  const [sets, setSets]                 = useState('');
 
   // Rehab
-  const [formFeedback,     setFormFeedback]     = useState(null);
-  const [isFormAnalyzing,  setIsFormAnalyzing]  = useState(false);
-  const [rehabPreviewUrl,  setRehabPreviewUrl]  = useState(null);
-  const [rehabFileType,    setRehabFileType]    = useState('image');
+  const [formFeedback, setFormFeedback]       = useState('');
+  const [isFormAnalyzing, setIsFormAnalyzing] = useState(false);
 
   // Scanner
   const [isMealAnalyzing, setIsMealAnalyzing] = useState(false);
-  const [mealAnalysis,    setMealAnalysis]    = useState(null);
-  const [mealPreviewUrl,  setMealPreviewUrl]  = useState(null);
+  const [mealAnalysis, setMealAnalysis]       = useState(null);
+  const [mealPreviewUrl, setMealPreviewUrl]   = useState(null);
 
-  // ── Firebase init ────────────────────────────────────────
+  // Rehab extra state
+  const [rehabPreviewUrl, setRehabPreviewUrl] = useState(null);
+  const [rehabFileType, setRehabFileType]     = useState('image');
+
+  // ── Firebase init ──────────────────────────────────────────────────────────
   useEffect(() => {
     let unsubscribeAuth = () => {};
     const initApp = async () => {
       try {
-        const isFirst = getApps().length === 0;
-        const app     = isFirst ? initializeApp(firebaseConfig) : getApps()[0];
+        const isFirstInit = getApps().length === 0;
+        const app = isFirstInit ? initializeApp(firebaseConfig) : getApps()[0];
         const firebaseAuth = getAuth(app);
-        const firestore = isFirst
+        const firestore = isFirstInit
           ? initializeFirestore(app, {
               localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
             })
           : getFirestore(app);
-
         setDb(firestore);
         setAuth(firebaseAuth);
-
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(firebaseAuth, __initial_auth_token);
         }
-
         unsubscribeAuth = onAuthStateChanged(firebaseAuth, u => {
           setUser(u);
           setLoading(false);
         });
       } catch (err) {
-        console.error('Firebase init error:', err);
+        console.error('Firebase Init Error:', err);
         setInitError(err.message);
         setLoading(false);
       }
@@ -1226,22 +1251,22 @@ const App = () => {
     return () => unsubscribeAuth();
   }, []);
 
-  // ── Firestore workouts listener ──────────────────────────
+  // ── Firestore listener ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!db || !user) return;
     const q = collection(db, 'artifacts', appId, 'users', user.uid, 'workouts');
-    const unsub = onSnapshot(
+    const unsubscribe = onSnapshot(
       q,
-      snap => {
-        const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      snapshot => {
+        const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
         setWorkouts(list.sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0)));
       },
-      err => console.warn('Firestore error:', err.code, err.message)
+      err => console.warn('Firestore snapshot error:', err.code, err.message)
     );
-    return () => unsub();
+    return () => unsubscribe();
   }, [db, user]);
 
-  // ── Auth handlers ────────────────────────────────────────
+  // ── Auth handlers ──────────────────────────────────────────────────────────
   const handleAuth = async e => {
     e.preventDefault();
     setAuthError('');
@@ -1253,13 +1278,8 @@ const App = () => {
         await createUserWithEmailAndPassword(auth, email, password);
       }
     } catch (err) {
-      if      (err.code === 'auth/operation-not-allowed')    setAuthError("Enable Email/Password auth in Firebase Console.");
-      else if (err.code === 'auth/invalid-credential')       setAuthError('Invalid email or password.');
-      else if (err.code === 'auth/user-not-found')           setAuthError('No account found with this email.');
-      else if (err.code === 'auth/wrong-password')           setAuthError('Incorrect password.');
-      else if (err.code === 'auth/email-already-in-use')     setAuthError('Email already registered. Sign in instead.');
-      else if (err.code === 'auth/weak-password')            setAuthError('Password must be at least 6 characters.');
-      else if (err.code === 'auth/network-request-failed')   setAuthError('Network error. Check your connection.');
+      if (err.code === 'auth/operation-not-allowed') setAuthError("Enable 'Email/Password' auth in Firebase Console.");
+      else if (err.code === 'auth/network-request-failed') setAuthError('Network error. Check your internet connection.');
       else setAuthError(err.message);
     }
   };
@@ -1270,43 +1290,45 @@ const App = () => {
     try {
       await signInAnonymously(auth);
     } catch (err) {
-      if      (err.code === 'auth/operation-not-allowed')    setAuthError("Enable Anonymous sign-in in Firebase Console.");
-      else if (err.code === 'auth/network-request-failed')   setAuthError('Network error. Check your connection.');
-      else setAuthError('Guest login failed. Please try again.');
+      if (err.code === 'auth/operation-not-allowed') setAuthError("Enable 'Anonymous' sign-in in Firebase Console.");
+      else if (err.code === 'auth/network-request-failed') setAuthError('Network error. Check your internet connection.');
+      else setAuthError('Guest login failed.');
     }
   };
 
-  // ── BMI / TDEE ───────────────────────────────────────────
+  // ── BMI / TDEE ─────────────────────────────────────────────────────────────
   const calculateBMI = useCallback(() => {
     const h = Number(bmiHeight) / 100;
     const w = Number(bmiWeight);
     const a = Number(age);
     if (!h || !w || !a) return;
 
-    const bmiVal  = (w / (h * h)).toFixed(1);
-    const bmrVal  = Math.round(10 * w + 6.25 * Number(bmiHeight) - 5 * a + 5);
-    const tdeeVal = Math.round(bmrVal * Number(pal));
-    const category = bmiVal < 18.5 ? 'Underweight' : bmiVal < 25 ? 'Normal' : bmiVal < 30 ? 'Overweight' : 'Obese';
+    const bmiVal    = (w / (h * h)).toFixed(1);
+    const bmrVal    = Math.round(10 * w + 6.25 * Number(bmiHeight) - 5 * a + 5);
+    const tdeeVal   = Math.round(bmrVal * Number(pal));
+    const category  = bmiVal < 18.5 ? 'Underweight' : bmiVal < 25 ? 'Normal' : bmiVal < 30 ? 'Overweight' : 'Obese';
 
     setBmiResult({ bmi: bmiVal, category, bmr: bmrVal, tdee: tdeeVal });
 
-    const obj       = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
-    const adjKcal   = Math.max(1200, tdeeVal + obj.kcalModifier);
-    const adjProt   = Math.round(w * obj.proteinMultiplier);
+    // Compute objective-adjusted targets
+    const obj = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
+    const adjKcal    = Math.max(1200, tdeeVal + obj.kcalModifier);
+    const adjProtein = Math.round(w * obj.proteinMultiplier);
     setTargetKcal(adjKcal);
-    setTargetProtein(adjProt);
+    setTargetProtein(adjProtein);
   }, [bmiHeight, bmiWeight, age, pal, fitnessObjective]);
 
+  // Recalculate targets when objective changes (if BMI already calculated)
   useEffect(() => {
     if (!bmiResult) return;
-    const obj     = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
-    const adjKcal = Math.max(1200, bmiResult.tdee + obj.kcalModifier);
-    const adjProt = Math.round(Number(bmiWeight) * obj.proteinMultiplier);
+    const obj = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
+    const adjKcal    = Math.max(1200, bmiResult.tdee + obj.kcalModifier);
+    const adjProtein = Math.round(Number(bmiWeight) * obj.proteinMultiplier);
     setTargetKcal(adjKcal);
-    setTargetProtein(adjProt);
+    setTargetProtein(adjProtein);
   }, [fitnessObjective, bmiResult, bmiWeight]);
 
-  // ── Protocol generation ──────────────────────────────────
+  // ── Protocol generation (Diet + Exercise) ─────────────────────────────────
   const generateProtocol = async () => {
     if (!bmiResult) return;
     setIsGeneratingDiet(true);
@@ -1314,32 +1336,33 @@ const App = () => {
     setWeeklyWorkoutPlan(null);
     setDietError('');
 
-    const obj     = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
-    const condStr = conditions.length ? conditions.join(', ') : 'None';
+    const obj = FITNESS_OBJECTIVES.find(o => o.id === fitnessObjective) || FITNESS_OBJECTIVES[2];
 
-    const prompt = `
+    try {
+      const condStr = conditions.length ? conditions.join(', ') : 'None';
+      const prompt = `
 You are an elite Indian certified dietitian AND strength & conditioning coach.
-Generate a STRICTLY ${dietPreference === 'veg' ? 'VEGETARIAN' : 'NON-VEGETARIAN'} 7-day Indian meal plan AND a matching weekly exercise protocol for objective: "${obj.label.toUpperCase()}".
+Generate a STRICTLY ${dietPreference === 'veg' ? 'VEGETARIAN' : 'NON-VEGETARIAN'} 7-day Indian meal plan AND a matching weekly exercise protocol, both SPECIFICALLY designed for the fitness objective: "${obj.label.toUpperCase()}".
 
 User Profile:
 - Fitness Objective: ${obj.label} (${obj.tagline})
-- BMI: ${bmiResult.bmi} (${bmiResult.category})
-- Target Calories: ${targetKcal} kcal/day
+- BMI Status: ${bmiResult.category} (BMI: ${bmiResult.bmi})
+- Target Calories: ${targetKcal} kcal/day (TDEE ${bmiResult.tdee} ${obj.kcalModifier >= 0 ? '+' : ''}${obj.kcalModifier})
 - Target Protein: ${targetProtein}g/day
 - Clinical Conditions: ${condStr}
 - Exercise Focus: ${obj.exerciseFocus}
 
-DIET RULES:
-${fitnessObjective === 'lose_weight'  ? '- Caloric deficit, high fiber, low GI, lean protein. Avoid fried/sugary.'  : ''}
-${fitnessObjective === 'gain_muscle'  ? '- Caloric surplus, high protein every meal, complex carbs pre/post workout.' : ''}
-${fitnessObjective === 'maintain'     ? '- Balanced macros, whole foods, adequate protein, daily variety.'            : ''}
+DIET RULES based on objective:
+${fitnessObjective === 'lose_weight' ? '- Caloric deficit meals, high fiber, low GI foods, lean proteins, avoid fried/sugary items' : ''}
+${fitnessObjective === 'gain_muscle' ? '- Caloric surplus meals, high protein at every meal, complex carbs pre/post workout, healthy fats' : ''}
+${fitnessObjective === 'maintain' ? '- Balanced macros, nutrient-dense whole foods, adequate protein, variety across days' : ''}
 
-EXERCISE RULES:
-${fitnessObjective === 'lose_weight'  ? '- HIIT 3x/week + compound lifts 2x/week + 2 active recovery days.'           : ''}
-${fitnessObjective === 'gain_muscle'  ? '- Progressive overload 4-5x/week, 8-12 rep hypertrophy ranges, 1-2 rest days.'  : ''}
-${fitnessObjective === 'maintain'     ? '- 3 strength days + 2 cardio/mobility + 2 rest/active days.'                  : ''}
+EXERCISE RULES based on objective:
+${fitnessObjective === 'lose_weight' ? '- Mix HIIT 3x/week with compound lifts 2x/week, active recovery days, progressive cardio' : ''}
+${fitnessObjective === 'gain_muscle' ? '- Progressive overload 4-5x/week, split by muscle groups, 8-12 rep hypertrophy ranges, 1-2 rest days' : ''}
+${fitnessObjective === 'maintain' ? '- 3 strength days, 2 cardio/mobility days, 2 rest/active days, balanced load' : ''}
 
-Return ONLY valid JSON (no markdown) with this exact structure:
+Return ONLY a valid JSON object with this exact structure:
 {
   "dietPlan": {
     "Monday":    { "Breakfast": "...", "Morning Snack": "...", "Lunch": "...", "Afternoon Snack": "...", "Dinner": "...", "Supper": "..." },
@@ -1351,10 +1374,10 @@ Return ONLY valid JSON (no markdown) with this exact structure:
     "Sunday":    { "Breakfast": "...", "Morning Snack": "...", "Lunch": "...", "Afternoon Snack": "...", "Dinner": "...", "Supper": "..." }
   },
   "workoutPlan": {
-    "focus": "One sentence describing the overall strategy for ${obj.label}",
-    "notes": "2-3 sentences: rest periods, progressive overload tips, recovery advice",
+    "focus": "One sentence describing the overall exercise strategy for ${obj.label}",
+    "notes": "2-3 sentences of key protocol notes (rest periods, progressive overload tips, recovery advice)",
     "weeklyRoutine": [
-      { "day": "Day 1 – Monday",    "activity": "Specific workout + exercises", "sets": "e.g. 4x8-12" },
+      { "day": "Day 1 – Monday",    "activity": "Specific workout name + exercises with sets/reps if applicable", "sets": "e.g. 4x8-12 each" },
       { "day": "Day 2 – Tuesday",   "activity": "...", "sets": "..." },
       { "day": "Day 3 – Wednesday", "activity": "...", "sets": "..." },
       { "day": "Day 4 – Thursday",  "activity": "...", "sets": "..." },
@@ -1363,125 +1386,87 @@ Return ONLY valid JSON (no markdown) with this exact structure:
       { "day": "Day 7 – Sunday",    "activity": "...", "sets": "..." }
     ]
   }
-}`.trim();
+}
+`.trim();
 
-    try {
+      // callGemini with isJson=true now returns an already-parsed object via extractJson()
       const parsed = await callGemini(prompt, '', null, true);
+
       setWeeklyDietPlan(parsed.dietPlan || null);
       setWeeklyWorkoutPlan(parsed.workoutPlan || null);
     } catch (err) {
-      console.error('Protocol generation error:', err);
+      console.error('Synthesis error:', err);
       setDietError(`Synthesis failed: ${err.message}. Please retry.`);
     } finally {
       setIsGeneratingDiet(false);
     }
   };
 
-  // ── Rehab / Form Vision ──────────────────────────────────
-  const analyzeFormVision = async e => {
-    const file = e.target.files?.[0];
+  // ── Form vision ────────────────────────────────────────────────────────────
+const analyzeFormVision = async e => {
+    const file = e.target.files[0];
     if (!file) return;
-
     setIsFormAnalyzing(true);
-    setFormFeedback(null);
-
+    setFormFeedback('');
+    // Generate preview URL
     const objectUrl = URL.createObjectURL(file);
     setRehabPreviewUrl(objectUrl);
     const isVideo = file.type.startsWith('video/');
     setRehabFileType(isVideo ? 'video' : 'image');
-
     try {
+      // For video: extract a representative frame; for images: resize normally
       const imageData = isVideo
         ? await extractVideoFrame(file, 2)
         : await resizeImageToBase64(file, 1024);
 
-      // FIX #3: Complete, structured rehab prompt with strict ytSuggestions rules
-//       const prompt = `
-// You are an elite NSCA-certified personal trainer and kinesiologist. Analyze the exercise image/video frame provided.
-
-// STEP 1 — VALIDATION:
-// First decide: is there a real person performing a physical exercise in the image?
-// - If YES → continue to STEP 2.
-// - If NO (screenshot, food, chart, animal, text, etc.) → return ONLY:
-//   { "error": "Invalid Content", "message": "No exercise detected. Please upload a photo or video of your workout form." }
-
-// STEP 2 — FULL FORM ANALYSIS:
-// Identify the exercise and provide a complete biomechanical critique.
-
-// Return ONLY this valid JSON (no markdown, no extra text):
+//       const prompt = `Analyze this exercise image/frame. Return ONLY a valid JSON object with this exact structure, no markdown:
 // {
-//   "exercise": "Exact exercise name e.g. Barbell Back Squat, Push-up, Romanian Deadlift",
-//   "muscles": "Primary: <list>. Secondary: <list>",
-//   "summary": "One sentence describing what is happening and the goal of this movement.",
-//   "good": [
-//     "Specific positive form point observed in THIS image",
-//     "Another correct technique point"
-//   ],
-//   "watchouts": [
-//     "Specific issue visible in THIS image e.g. knees caving inward",
-//     "Another issue"
-//   ],
-//   "fixes": [
-//     "Actionable correction #1 e.g. Push knees outward in line with toes",
-//     "Actionable correction #2",
-//     "Actionable correction #3"
-//   ],
-//   "injuryRisks": [
-//     "Risk tied to the identified issues e.g. Valgus collapse increases ACL stress",
-//     "Another risk"
-//   ],
+//   "exercise": "exact exercise name e.g. Push-up, Barbell Squat, Plank",
+//   "muscles": "Primary: chest, triceps — Secondary: core, shoulders",
+//   "summary": "One sentence describing what the person is doing and the goal of this movement.",
+//   "good": ["Point 1 about what looks correct", "Point 2"],
+//   "watchouts": ["Issue 1 observed e.g. head too high can strain neck", "Issue 2"],
+//   "fixes": ["Fix 1 e.g. Look slightly down not forward", "Fix 2", "Fix 3"],
+//   "injuryRisks": ["Risk 1 e.g. Lower back dropping increases lumbar strain", "Risk 2"],
 //   "ytSuggestions": [
-//     {
-//       "title": "Perfect [EXERCISE NAME] Form Tutorial",
-//       "query": "[exercise name] correct form tutorial step by step beginner",
-//       "reason": "Learn the exact technique cues from certified coaches"
-//     },
-//     {
-//       "title": "Fix [EXERCISE NAME] Common Mistakes",
-//       "query": "[exercise name] common form mistakes corrections how to fix",
-//       "reason": "Directly addresses the errors visible in your form"
-//     },
-//     {
-//       "title": "[EXERCISE NAME] for Beginners — Full Guide",
-//       "query": "[exercise name] beginner guide full tutorial proper technique",
-//       "reason": "Build a solid foundation before adding more weight"
-//     }
+//     { "title": "Perfect Push-up Form Tutorial", "query": "perfect push-up form tutorial beginner", "reason": "Master the correct technique step by step" },
+//     { "title": "Push-up Progressions for Beginners", "query": "push-up progressions beginner intermediate", "reason": "Build strength safely to improve your form" },
+//     { "title": "Fix Your Push-up Common Mistakes", "query": "fix push-up common mistakes corrections", "reason": "Directly addresses the issues seen in your form" }
 //   ]
 // }
 
-// CRITICAL RULES FOR ytSuggestions:
-// - Replace [EXERCISE NAME] with the EXACT exercise you identified (e.g. "Push-up", "Squat").
-// - Queries MUST include words like: form, tutorial, technique, correction, how to.
-// - Queries must NOT contain: music, song, lyrics, movie, vlog, prank.
-// - These are YouTube SEARCH queries — make them precise and exercise-specific.
-// `
-// 
-
+// Adapt the ytSuggestions to the actual exercise identified. Be specific to THIS image only.`;
+// Replace the existing prompt inside analyzeFormVision
 const prompt = `
-Analyze the biomechanics in this frame.
-1. ORIENTATION: Is the person horizontal (Push-up/Plank) or vertical (Lateral Raise)?
-2. If horizontal and arms are moving at the elbow/shoulder, it is a PUSH-UP.
-3. If vertical and arms move away from the body, it is a LATERAL RAISE.
+  You are an AI Biomechanics Engine.
 
-STRICT IDENTIFICATION:
-Do not guess based on background equipment. Look ONLY at the person's joints.
-`.trim();
+  PHASE 1: HUMAN DETECTION
+  - Analyze the image. Is there a person performing a workout? 
+  - If no person/exercise is found (e.g., it is a screenshot of a chart or app), return:
+    {"error": "Invalid Content", "message": "No exercise detected. Upload a photo/video of your form."}
 
-      const result = await callGemini(
+  PHASE 2: FORM ANALYSIS
+  - Identify exercise and muscles used.
+  - Provide "good", "watchouts", "fixes", and "injuryRisks".
+  - Return ytSuggestions matching the exercise.
+
+  Return ONLY valid JSON. No markdown.
+`;
+
+      const result = await callGeminiVision(
         prompt,
-        'You are an expert kinesiologist. Analyze the image. Return ONLY valid JSON, no markdown.',
+        'You are an elite kinesiologist and NSCA-certified personal trainer. Analyze the image directly. Return ONLY valid JSON, no markdown, no extra text. The ytSuggestions should match the identified exercise.',
         imageData,
         true
       );
       setFormFeedback(result);
     } catch (err) {
-      setFormFeedback({ error: 'Analysis Failed', message: err.message });
+      setFormFeedback(`Analysis failed: ${err.message}`);
     } finally {
       setIsFormAnalyzing(false);
     }
   };
-
-  // ── Workout submit ───────────────────────────────────────
+  // ── Workout submit ─────────────────────────────────────────────────────────
   const handleWorkoutSubmit = async e => {
     e.preventDefault();
     if (!user || !db || !exerciseName) return;
@@ -1500,125 +1485,191 @@ Do not guess based on background equipment. Look ONLY at the person's joints.
     }
   };
 
-  // ── Food Vision / Meal Scanner ───────────────────────────
+  // ── Meal scanner ───────────────────────────────────────────────────────────
   const analyzeMealImage = async e => {
-    const file = e.target.files?.[0];
+    const file = e.target.files[0];
     if (!file) return;
-
     setIsMealAnalyzing(true);
     setMealAnalysis(null);
-
-    const objectUrl = URL.createObjectURL(file);
-    setMealPreviewUrl(objectUrl);
-
     try {
+      // Resize to 1024px max — larger images don't improve accuracy but slow the call
       const imageData = await resizeImageToBase64(file, 1024);
 
-//       const nutritionPrompt = `
-// You are a highly accurate Food Vision AI and Registered Dietitian specialising in Indian cuisine.
+      // Step 1: identify the dish first in plain text (more reliable than one-shot JSON)
+      // Set preview
+      const objectUrl = URL.createObjectURL(file);
+      setMealPreviewUrl(objectUrl);
 
-// ═══════════════════════════════════
-// PHASE 1 — VALIDATION (CRITICAL)
-// ═══════════════════════════════════
-// Is there clearly identifiable FOOD or DRINK in this image?
+//       const nutritionPrompt = `You are an expert Indian and global food nutritionist with deep knowledge of South Asian cuisines.
+// Analyze this food image precisely. Identify EVERY food item visible.
 
-// Reject the image if ANY of the following apply:
-// - No food visible
-// - Blurry / too dark / abstract
-// - Screenshot / UI / chart / text
-// - Person / gym / equipment only (no food)
-// - Packaged item with no visible food inside
-
-// If rejected, return ONLY:
-// { "error": "Invalid Content", "message": "No food detected. Please upload a clear photo of your meal." }
-
-// ═══════════════════════════════════
-// PHASE 2 — FOOD IDENTIFICATION
-// ═══════════════════════════════════
-// If food is clearly visible:
-// - Identify EVERY food item you can see (do NOT guess items that are not visible).
-// - For Indian foods, be precise: Roti, Dal Tadka, Paneer Butter Masala, Biryani, etc.
-// - Estimate realistic portion sizes based on plate/bowl size.
-// - Calculate accurate calories and macros for each item using standard nutritional databases.
-// - The top-level dish name should be the MOST PROMINENT item or a combined description.
-
-// ═══════════════════════════════════
-// PHASE 3 — OUTPUT (STRICT FORMAT)
-// ═══════════════════════════════════
 // Return ONLY this valid JSON object (no markdown, no extra text):
-
 // {
-//   "dish": "Descriptive name e.g. Dal Tadka with Steamed Rice and Roti",
-//   "serving": "Total estimated serving e.g. 1 plate (~450g)",
-//   "confidence": "high",
+//   "dish": "Main dish name, specific (e.g. Whole Wheat Roti with Dal Tadka)",
+//   "serving": "Estimated serving size (e.g. 2 rotis + 1 katori dal)",
+//   "calories": 320,
+//   "protein": 11,
+//   "carbs": 52,
+//   "fat": 7,
 //   "items": [
-//     {
-//       "name": "Dal Tadka",
-//       "serving": "1 katori (150ml)",
-//       "calories": 140,
-//       "protein": 8,
-//       "carbs": 18,
-//       "fat": 4
-//     },
-//     {
-//       "name": "Steamed Rice",
-//       "serving": "1 cup (160g cooked)",
-//       "calories": 206,
-//       "protein": 4,
-//       "carbs": 45,
-//       "fat": 0
-//     }
+//     { "name": "Whole Wheat Roti", "serving": "2 pieces (60g)", "calories": 180, "protein": 6, "carbs": 36, "fat": 3 },
+//     { "name": "Dal Tadka", "serving": "1 katori (150ml)", "calories": 140, "protein": 5, "carbs": 16, "fat": 4 }
 //   ],
-//   "totalNutrition": {
-//     "calories": 346,
-//     "protein": 12,
-//     "carbs": 63,
-//     "fat": 4
-//   },
-//   "tips": "A realistic, specific dietitian tip about this meal e.g. Add a source of healthy fat like a teaspoon of ghee for better fat-soluble vitamin absorption."
+//   "tips": "A short dietitian tip about this meal (e.g. high fiber, add protein source, etc.)"
 // }
 
-// ACCURACY RULES:
-// - totalNutrition MUST be the SUM of all items. Double-check arithmetic.
-// - Do NOT list items you cannot actually see in the image.
-// - Use Indian standard serving sizes (katori, roti, cup) where appropriate.
+// If only one item is visible, the items array should have one entry. Be accurate for Indian foods like roti, rice, dal, sabzi, paneer, chicken, biryani, etc.`;
+// const nutritionPrompt = `You are an expert Indian and global food nutritionist.
+// CRITICAL: If the image does NOT contain food or drink, return only: {"error": "Invalid Image", "message": "Please upload a clear photo of your meal for nutritional analysis."}
 
-// Inside analyzeMealImage function in App.jsx
-const nutritionPrompt = `
+// Identify EVERY food item visible. Return ONLY this valid JSON object (no markdown):
+// {
+//   "dish": "Main dish name (e.g. Paneer Butter Masala with Garlic Naan)",
+//   "serving": "Estimated serving size (e.g. 1 bowl + 2 naans)",
+//   "calories": 0,
+//   "protein": 0,
+//   "carbs": 0,
+//   "fat": 0,
+//   "items": [
+//     { "name": "Item Name", "serving": "size", "calories": 0, "protein": 0, "carbs": 0, "fat": 0 }
+//   ],
+//   "tips": "A short dietitian tip regarding balance or portion control."
+// }
+// Be highly accurate for Indian staples like Roti, Dal, Sabzi, and Biryani.`;
+// Replace the existing nutritionPrompt inside analyzeMealImage
+      const nutritionPrompt = `
 You are a highly strict Food Vision AI.
-Your PRIMARY goal is CORRECT CLASSIFICATION over helpfulness.
 
-PHASE 1: HARD CLASSIFICATION
-1. Check for identifiable food. If it's a pancake, do NOT call it a Roti just because the app is "Indian."
-2. If texture is "spongy/layered/syrup," it is a Pancake.
-3. If texture is "leavened/fried/hollow," it is Bhature.
+Your PRIMARY goal is NOT nutrition.
+Your PRIMARY goal is CORRECT CLASSIFICATION.
 
-REJECTION RULES:
-- If confidence is LOW → Return {"error": "Low Confidence", "message": "Cannot reliably detect food."}
-- NEVER hallucinate unseen items (e.g., don't add Chole if only bread is visible).
+-----------------------------------
+PHASE 1: HARD CLASSIFICATION (CRITICAL)
+-----------------------------------
+Carefully analyze the image step-by-step:
 
-OUTPUT JSON:
+Step 1: Check if actual edible food is clearly visible.
+
+Food MUST satisfy ALL:
+- Recognizable edible texture (solid/liquid food)
+- Clear shape (not abstract or blurry)
+- Context of food (plate, bowl, hand holding food, etc.)
+
+If ANY of these fail → classify as NOT FOOD.
+
+-----------------------------------
+STRICT REJECTION RULES
+-----------------------------------
+Immediately return NOT FOOD if:
+- Image is blurry / dark / unclear
+- Looks like background, floor, wall, object
+- Screenshot / UI / text
+- Gym / person / body / exercise
+- Packaged item without visible food
+- Ambiguous shapes
+
+⚠️ IMPORTANT:
+If unsure → ALWAYS reject (DO NOT GUESS)
+
+-----------------------------------
+PHASE 2: CONFIDENCE CHECK
+-----------------------------------
+Before proceeding, assign confidence:
+
+- HIGH → clearly visible food
+- MEDIUM → somewhat visible but not perfect
+- LOW → unclear / ambiguous
+
+If confidence is LOW → RETURN ERROR
+
+Return:
 {
-  "dish": "Specific name",
-  "confidence": "high/medium",
-  "totalNutrition": { "calories": int, "protein": int, "carbs": int, "fat": int },
-  "items": [{ "name": "item", "calories": int }]
+  "error": "Low Confidence",
+  "message": "Image is unclear. Cannot reliably detect food."
 }
-`.trim();
 
-      const raw    = await callGemini(nutritionPrompt, 'You are a precise food nutritionist. Return ONLY valid JSON.', imageData, true);
-      // FIX #1: Always normalise so UI always reads flat top-level numbers
-      const parsed = normalizeMealAnalysis(raw);
+-----------------------------------
+PHASE 3: FOOD DETECTION (ONLY IF HIGH/MEDIUM)
+-----------------------------------
+Now identify ONLY visible food:
+
+STRICT RULES:
+- DO NOT assume full meals
+- DO NOT add items not visible
+- DO NOT default to "roti" or common foods
+- Identify based on:
+   shape + texture + color
+
+Examples:
+- Round flat brown → Roti
+- White grains → Rice
+- Yellow liquid → Dal
+- Mixed rice + spices → Biryani
+
+If shape does NOT match clearly → DO NOT NAME IT
+
+-----------------------------------
+PHASE 4: OUTPUT JSON ONLY
+-----------------------------------
+
+If NOT FOOD:
+{
+  "error": "Invalid Content",
+  "message": "No food detected in the image."
+}
+
+If FOOD:
+{
+  "dish": "ONLY if confidently identifiable, else 'Unknown Food Item'",
+  "confidence": "high / medium",
+
+  "items": [
+    {
+      "name": "ONLY clearly visible item",
+      "serving": "estimated portion",
+      "calories": integer,
+      "protein": integer,
+      "carbs": integer,
+      "fat": integer
+    }
+  ],
+
+  "totalNutrition": {
+    "calories": integer,
+    "protein": integer,
+    "carbs": integer,
+    "fat": integer
+  },
+
+  "tips": "Short realistic advice"
+}
+
+-----------------------------------
+FINAL RULES (VERY IMPORTANT)
+-----------------------------------
+- When in doubt → REJECT
+- NEVER guess food name
+- NEVER default to roti
+- NEVER hallucinate unseen items
+- Accuracy > completeness
+`;
+
+
+      const parsed = await callGeminiVision(
+        nutritionPrompt,
+        'You are a registered dietitian specializing in Indian cuisine. Identify food items precisely. Return ONLY valid JSON.',
+        imageData,
+        true
+      );
       setMealAnalysis(parsed);
     } catch (err) {
       console.error('Meal analysis error:', err);
-      setMealAnalysis({ error: 'Analysis Failed', message: `${err.message}. Please retry with a clearer image.` });
+      setMealAnalysis({ dish: 'Analysis failed — please retry', calories: 0, protein: 0, carbs: 0, fat: 0 });
     } finally {
       setIsMealAnalyzing(false);
     }
   };
-
-  // ── Render: Loading ──────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
   if (loading) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
@@ -1630,7 +1681,6 @@ OUTPUT JSON:
     );
   }
 
-  // ── Render: Auth ─────────────────────────────────────────
   if (!user) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4 font-sans">
@@ -1642,32 +1692,28 @@ OUTPUT JSON:
             <h1 className="text-4xl font-black text-slate-900 tracking-tighter uppercase italic">Nutri Track</h1>
             <p className="text-slate-400 text-xs font-bold uppercase tracking-[0.3em] mt-1">Next-Gen AI Partner</p>
           </div>
-
           {initError && (
             <div className="mb-4 p-3 bg-red-50 border border-red-100 rounded-2xl">
               <p className="text-xs text-red-500 font-bold">⚠ Init Error: {initError}</p>
             </div>
           )}
-
           <form onSubmit={handleAuth} className="space-y-4">
             <input
               type="email"
               placeholder="Email Address"
               value={email}
               onChange={e => setEmail(e.target.value)}
-              required
               className="w-full bg-slate-50 border border-slate-100 rounded-2xl p-4 outline-none focus:ring-2 focus:ring-green-500 transition-all font-bold"
             />
             <input
               type="password"
-              placeholder="Password (min 6 chars)"
+              placeholder="Access Key"
               value={password}
               onChange={e => setPassword(e.target.value)}
-              required
               className="w-full bg-slate-50 border border-slate-100 rounded-2xl p-4 outline-none focus:ring-2 focus:ring-green-500 transition-all font-bold"
             />
             {authError && (
-              <p className="text-[11px] text-red-500 text-center font-bold px-2">{authError}</p>
+              <p className="text-[10px] text-red-500 text-center font-bold px-2 uppercase">{authError}</p>
             )}
             <button
               type="submit"
@@ -1676,7 +1722,6 @@ OUTPUT JSON:
               {authView === 'login' ? 'Proceed to System' : 'Create Profile'}
             </button>
           </form>
-
           <div className="mt-8 text-center">
             <button
               onClick={() => { setAuthView(v => v === 'login' ? 'signup' : 'login'); setAuthError(''); }}
@@ -1701,11 +1746,9 @@ OUTPUT JSON:
     );
   }
 
-  // ── Render: Main App ─────────────────────────────────────
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans">
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} onLogout={() => signOut(auth)} />
-
       <main className="pb-20">
         {activeTab === 'home' && (
           <div className="max-w-7xl mx-auto px-4 py-32 text-center">
@@ -1715,6 +1758,7 @@ OUTPUT JSON:
             <p className="text-xl text-slate-500 max-w-2xl mx-auto mb-12 leading-relaxed font-medium">
               Harnessing cutting-edge ML logic to transform nutrition insights into peak performance outcomes.
             </p>
+            {/* Objective preview on home */}
             <div className="flex justify-center gap-4 mb-10">
               {FITNESS_OBJECTIVES.map(({ id, label, icon: Icon, colorClass }) => (
                 <button
@@ -1745,14 +1789,14 @@ OUTPUT JSON:
 
         {activeTab === 'dietetics' && (
           <HealthTab
-            bmiHeight={bmiHeight}         setBmiHeight={setBmiHeight}
-            bmiWeight={bmiWeight}         setBmiWeight={setBmiWeight}
-            age={age}                     setAge={setAge}
-            pal={pal}                     setPal={setPal}
-            conditions={conditions}       setConditions={setConditions}
-            dietPreference={dietPreference}   setDietPreference={setDietPreference}
+            bmiHeight={bmiHeight} setBmiHeight={setBmiHeight}
+            bmiWeight={bmiWeight} setBmiWeight={setBmiWeight}
+            age={age} setAge={setAge}
+            pal={pal} setPal={setPal}
+            conditions={conditions} setConditions={setConditions}
+            dietPreference={dietPreference} setDietPreference={setDietPreference}
             fitnessObjective={fitnessObjective} setFitnessObjective={setFitnessObjective}
-            calculateBMI={calculateBMI}   bmiResult={bmiResult}
+            calculateBMI={calculateBMI} bmiResult={bmiResult}
             generateProtocol={generateProtocol}
             isGeneratingDiet={isGeneratingDiet}
             dietPlan={weeklyDietPlan}
@@ -1772,10 +1816,10 @@ OUTPUT JSON:
             <WorkoutTab
               handleWorkoutSubmit={handleWorkoutSubmit}
               exerciseName={exerciseName} setExerciseName={setExerciseName}
-              bodyPart={bodyPart}         setBodyPart={setBodyPart}
-              weight={weight}             setWeight={setWeight}
-              reps={reps}                 setReps={setReps}
-              sets={sets}                 setSets={setSets}
+              bodyPart={bodyPart} setBodyPart={setBodyPart}
+              weight={weight} setWeight={setWeight}
+              reps={reps} setReps={setReps}
+              sets={sets} setSets={setSets}
               workouts={workouts}
             />
           </div>
@@ -1783,24 +1827,13 @@ OUTPUT JSON:
 
         {activeTab === 'scanner' && (
           <div className="max-w-4xl mx-auto px-4 py-12">
-            <ScannerTab
-              analyzeMealImage={analyzeMealImage}
-              isMealAnalyzing={isMealAnalyzing}
-              mealAnalysis={mealAnalysis}
-              previewUrl={mealPreviewUrl}
-            />
+            <ScannerTab analyzeMealImage={analyzeMealImage} isMealAnalyzing={isMealAnalyzing} mealAnalysis={mealAnalysis} previewUrl={mealPreviewUrl} />
           </div>
         )}
 
         {activeTab === 'rehab' && (
           <div className="max-w-4xl mx-auto px-4 py-12">
-            <RehabTab
-              analyzeFormVision={analyzeFormVision}
-              isFormAnalyzing={isFormAnalyzing}
-              formFeedback={formFeedback}
-              rehabPreviewUrl={rehabPreviewUrl}
-              rehabFileType={rehabFileType}
-            />
+            <RehabTab analyzeFormVision={analyzeFormVision} isFormAnalyzing={isFormAnalyzing} formFeedback={formFeedback} rehabPreviewUrl={rehabPreviewUrl} rehabFileType={rehabFileType} />
           </div>
         )}
       </main>
